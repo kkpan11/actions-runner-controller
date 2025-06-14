@@ -28,6 +28,7 @@ import (
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -44,11 +45,23 @@ const (
 // EphemeralRunnerReconciler reconciles a EphemeralRunner object
 type EphemeralRunnerReconciler struct {
 	client.Client
-	Log           logr.Logger
-	Scheme        *runtime.Scheme
-	ActionsClient actions.MultiClient
+	Log    logr.Logger
+	Scheme *runtime.Scheme
 	ResourceBuilder
 }
+
+// precompute backoff durations for failed ephemeral runners
+// the len(failedRunnerBackoff) must be equal to maxFailures + 1
+var failedRunnerBackoff = []time.Duration{
+	0,
+	5 * time.Second,
+	10 * time.Second,
+	20 * time.Second,
+	40 * time.Second,
+	80 * time.Second,
+}
+
+const maxFailures = 5
 
 // +kubebuilder:rbac:groups=actions.github.com,resources=ephemeralrunners,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=actions.github.com,resources=ephemeralrunners/status,verbs=get;update;patch
@@ -173,6 +186,29 @@ func (r *EphemeralRunnerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 	}
 
+	if len(ephemeralRunner.Status.Failures) > maxFailures {
+		log.Info(fmt.Sprintf("EphemeralRunner has failed more than %d times. Deleting ephemeral runner so it can be re-created", maxFailures))
+		if err := r.Delete(ctx, ephemeralRunner); err != nil {
+			log.Error(fmt.Errorf("failed to delete ephemeral runner after %d failures: %w", maxFailures, err), "Failed to delete ephemeral runner")
+			return ctrl.Result{}, err
+		}
+
+		return ctrl.Result{}, nil
+	}
+
+	now := metav1.Now()
+	lastFailure := ephemeralRunner.Status.LastFailure()
+	backoffDuration := failedRunnerBackoff[len(ephemeralRunner.Status.Failures)]
+	nextReconciliation := lastFailure.Add(backoffDuration)
+	if !lastFailure.IsZero() && now.Before(&metav1.Time{Time: nextReconciliation}) {
+		log.Info("Backing off the next reconciliation due to failure",
+			"lastFailure", lastFailure,
+			"nextReconciliation", nextReconciliation,
+			"requeueAfter", nextReconciliation.Sub(now.Time),
+		)
+		return ctrl.Result{RequeueAfter: now.Sub(nextReconciliation)}, nil
+	}
+
 	secret := new(corev1.Secret)
 	if err := r.Get(ctx, req.NamespacedName, secret); err != nil {
 		if !kerrors.IsNotFound(err) {
@@ -196,39 +232,28 @@ func (r *EphemeralRunnerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	pod := new(corev1.Pod)
 	if err := r.Get(ctx, req.NamespacedName, pod); err != nil {
-		switch {
-		case !kerrors.IsNotFound(err):
+		if !kerrors.IsNotFound(err) {
 			log.Error(err, "Failed to fetch the pod")
 			return ctrl.Result{}, err
+		}
 
-		case len(ephemeralRunner.Status.Failures) > 5:
-			log.Info("EphemeralRunner has failed more than 5 times. Marking it as failed")
-			errMessage := fmt.Sprintf("Pod has failed to start more than 5 times: %s", pod.Status.Message)
-			if err := r.markAsFailed(ctx, ephemeralRunner, errMessage, ReasonTooManyPodFailures, log); err != nil {
+		// Pod was not found. Create if the pod has never been created
+		log.Info("Creating new EphemeralRunner pod.")
+		result, err := r.createPod(ctx, ephemeralRunner, secret, log)
+		switch {
+		case err == nil:
+			return result, nil
+		case kerrors.IsInvalid(err) || kerrors.IsForbidden(err):
+			log.Error(err, "Failed to create a pod due to unrecoverable failure")
+			errMessage := fmt.Sprintf("Failed to create the pod: %v", err)
+			if err := r.markAsFailed(ctx, ephemeralRunner, errMessage, ReasonInvalidPodFailure, log); err != nil {
 				log.Error(err, "Failed to set ephemeral runner to phase Failed")
 				return ctrl.Result{}, err
 			}
 			return ctrl.Result{}, nil
-
 		default:
-			// Pod was not found. Create if the pod has never been created
-			log.Info("Creating new EphemeralRunner pod.")
-			result, err := r.createPod(ctx, ephemeralRunner, secret, log)
-			switch {
-			case err == nil:
-				return result, nil
-			case kerrors.IsInvalid(err) || kerrors.IsForbidden(err):
-				log.Error(err, "Failed to create a pod due to unrecoverable failure")
-				errMessage := fmt.Sprintf("Failed to create the pod: %v", err)
-				if err := r.markAsFailed(ctx, ephemeralRunner, errMessage, ReasonInvalidPodFailure, log); err != nil {
-					log.Error(err, "Failed to set ephemeral runner to phase Failed")
-					return ctrl.Result{}, err
-				}
-				return ctrl.Result{}, nil
-			default:
-				log.Error(err, "Failed to create the pod")
-				return ctrl.Result{}, err
-			}
+			log.Error(err, "Failed to create the pod")
+			return ctrl.Result{}, err
 		}
 	}
 
@@ -484,9 +509,9 @@ func (r *EphemeralRunnerReconciler) deletePodAsFailed(ctx context.Context, ephem
 	log.Info("Updating ephemeral runner status to track the failure count")
 	if err := patchSubResource(ctx, r.Status(), ephemeralRunner, func(obj *v1alpha1.EphemeralRunner) {
 		if obj.Status.Failures == nil {
-			obj.Status.Failures = make(map[string]bool)
+			obj.Status.Failures = make(map[string]metav1.Time)
 		}
-		obj.Status.Failures[string(pod.UID)] = true
+		obj.Status.Failures[string(pod.UID)] = metav1.Now()
 		obj.Status.Ready = false
 		obj.Status.Reason = pod.Status.Reason
 		obj.Status.Message = pod.Status.Message
@@ -503,7 +528,7 @@ func (r *EphemeralRunnerReconciler) deletePodAsFailed(ctx context.Context, ephem
 func (r *EphemeralRunnerReconciler) updateStatusWithRunnerConfig(ctx context.Context, ephemeralRunner *v1alpha1.EphemeralRunner, log logr.Logger) (*ctrl.Result, error) {
 	// Runner is not registered with the service. We need to register it first
 	log.Info("Creating ephemeral runner JIT config")
-	actionsClient, err := r.actionsClientFor(ctx, ephemeralRunner)
+	actionsClient, err := r.GetActionsService(ctx, ephemeralRunner)
 	if err != nil {
 		return &ctrl.Result{}, fmt.Errorf("failed to get actions client for generating JIT config: %w", err)
 	}
@@ -727,77 +752,10 @@ func (r *EphemeralRunnerReconciler) updateRunStatusFromPod(ctx context.Context, 
 	return nil
 }
 
-func (r *EphemeralRunnerReconciler) actionsClientFor(ctx context.Context, runner *v1alpha1.EphemeralRunner) (actions.ActionsService, error) {
-	secret := new(corev1.Secret)
-	if err := r.Get(ctx, types.NamespacedName{Namespace: runner.Namespace, Name: runner.Spec.GitHubConfigSecret}, secret); err != nil {
-		return nil, fmt.Errorf("failed to get secret: %w", err)
-	}
-
-	opts, err := r.actionsClientOptionsFor(ctx, runner)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get actions client options: %w", err)
-	}
-
-	return r.ActionsClient.GetClientFromSecret(
-		ctx,
-		runner.Spec.GitHubConfigUrl,
-		runner.Namespace,
-		secret.Data,
-		opts...,
-	)
-}
-
-func (r *EphemeralRunnerReconciler) actionsClientOptionsFor(ctx context.Context, runner *v1alpha1.EphemeralRunner) ([]actions.ClientOption, error) {
-	var opts []actions.ClientOption
-	if runner.Spec.Proxy != nil {
-		proxyFunc, err := runner.Spec.Proxy.ProxyFunc(func(s string) (*corev1.Secret, error) {
-			var secret corev1.Secret
-			err := r.Get(ctx, types.NamespacedName{Namespace: runner.Namespace, Name: s}, &secret)
-			if err != nil {
-				return nil, fmt.Errorf("failed to get proxy secret %s: %w", s, err)
-			}
-
-			return &secret, nil
-		})
-		if err != nil {
-			return nil, fmt.Errorf("failed to get proxy func: %w", err)
-		}
-
-		opts = append(opts, actions.WithProxy(proxyFunc))
-	}
-
-	tlsConfig := runner.Spec.GitHubServerTLS
-	if tlsConfig != nil {
-		pool, err := tlsConfig.ToCertPool(func(name, key string) ([]byte, error) {
-			var configmap corev1.ConfigMap
-			err := r.Get(
-				ctx,
-				types.NamespacedName{
-					Namespace: runner.Namespace,
-					Name:      name,
-				},
-				&configmap,
-			)
-			if err != nil {
-				return nil, fmt.Errorf("failed to get configmap %s: %w", name, err)
-			}
-
-			return []byte(configmap.Data[key]), nil
-		})
-		if err != nil {
-			return nil, fmt.Errorf("failed to get tls config: %w", err)
-		}
-
-		opts = append(opts, actions.WithRootCAs(pool))
-	}
-
-	return opts, nil
-}
-
 // runnerRegisteredWithService checks if the runner is still registered with the service
 // Returns found=false and err=nil if ephemeral runner does not exist in GitHub service and should be deleted
 func (r EphemeralRunnerReconciler) runnerRegisteredWithService(ctx context.Context, runner *v1alpha1.EphemeralRunner, log logr.Logger) (found bool, err error) {
-	actionsClient, err := r.actionsClientFor(ctx, runner)
+	actionsClient, err := r.GetActionsService(ctx, runner)
 	if err != nil {
 		return false, fmt.Errorf("failed to get Actions client for ScaleSet: %w", err)
 	}
@@ -824,7 +782,7 @@ func (r EphemeralRunnerReconciler) runnerRegisteredWithService(ctx context.Conte
 }
 
 func (r *EphemeralRunnerReconciler) deleteRunnerFromService(ctx context.Context, ephemeralRunner *v1alpha1.EphemeralRunner, log logr.Logger) error {
-	client, err := r.actionsClientFor(ctx, ephemeralRunner)
+	client, err := r.GetActionsService(ctx, ephemeralRunner)
 	if err != nil {
 		return fmt.Errorf("failed to get actions client for runner: %w", err)
 	}
