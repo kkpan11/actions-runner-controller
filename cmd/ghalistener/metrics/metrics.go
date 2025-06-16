@@ -21,6 +21,7 @@ const (
 	labelKeyOrganization            = "organization"
 	labelKeyRepository              = "repository"
 	labelKeyJobName                 = "job_name"
+	labelKeyJobWorkflowRef          = "job_workflow_ref"
 	labelKeyEventName               = "event_name"
 	labelKeyJobResult               = "job_result"
 )
@@ -75,11 +76,12 @@ var metricsHelp = metricsHelpRegistry{
 
 func (e *exporter) jobLabels(jobBase *actions.JobMessageBase) prometheus.Labels {
 	return prometheus.Labels{
-		labelKeyEnterprise:   e.scaleSetLabels[labelKeyEnterprise],
-		labelKeyOrganization: jobBase.OwnerName,
-		labelKeyRepository:   jobBase.RepositoryName,
-		labelKeyJobName:      jobBase.JobDisplayName,
-		labelKeyEventName:    jobBase.EventName,
+		labelKeyEnterprise:     e.scaleSetLabels[labelKeyEnterprise],
+		labelKeyOrganization:   jobBase.OwnerName,
+		labelKeyRepository:     jobBase.RepositoryName,
+		labelKeyJobName:        jobBase.JobDisplayName,
+		labelKeyJobWorkflowRef: jobBase.JobWorkflowRef,
+		labelKeyEventName:      jobBase.EventName,
 	}
 }
 
@@ -152,13 +154,148 @@ type ExporterConfig struct {
 	ServerAddr        string
 	ServerEndpoint    string
 	Logger            logr.Logger
-	Metrics           v1alpha1.MetricsConfig
+	Metrics           *v1alpha1.MetricsConfig
+}
+
+var defaultMetrics = v1alpha1.MetricsConfig{
+	Counters: map[string]*v1alpha1.CounterMetric{
+		MetricStartedJobsTotal: {
+			Labels: []string{
+				labelKeyEnterprise,
+				labelKeyOrganization,
+				labelKeyRepository,
+				labelKeyJobName,
+				labelKeyEventName,
+			},
+		},
+		MetricCompletedJobsTotal: {
+			Labels: []string{
+				labelKeyEnterprise,
+				labelKeyOrganization,
+				labelKeyRepository,
+				labelKeyJobName,
+				labelKeyEventName,
+				labelKeyJobResult,
+			},
+		},
+	},
+	Gauges: map[string]*v1alpha1.GaugeMetric{
+		MetricAssignedJobs: {
+			Labels: []string{
+				labelKeyEnterprise,
+				labelKeyOrganization,
+				labelKeyRepository,
+				labelKeyRunnerScaleSetName,
+				labelKeyRunnerScaleSetNamespace,
+			},
+		},
+		MetricRunningJobs: {
+			Labels: []string{
+				labelKeyEnterprise,
+				labelKeyOrganization,
+				labelKeyRepository,
+				labelKeyRunnerScaleSetName,
+				labelKeyRunnerScaleSetNamespace,
+			},
+		},
+		MetricRegisteredRunners: {
+			Labels: []string{
+				labelKeyEnterprise,
+				labelKeyOrganization,
+				labelKeyRepository,
+				labelKeyRunnerScaleSetName,
+				labelKeyRunnerScaleSetNamespace,
+			},
+		},
+		MetricBusyRunners: {
+			Labels: []string{
+				labelKeyEnterprise,
+				labelKeyOrganization,
+				labelKeyRepository,
+				labelKeyRunnerScaleSetName,
+				labelKeyRunnerScaleSetNamespace,
+			},
+		},
+		MetricMinRunners: {
+			Labels: []string{
+				labelKeyEnterprise,
+				labelKeyOrganization,
+				labelKeyRepository,
+				labelKeyRunnerScaleSetName,
+				labelKeyRunnerScaleSetNamespace,
+			},
+		},
+		MetricMaxRunners: {
+			Labels: []string{
+				labelKeyEnterprise,
+				labelKeyOrganization,
+				labelKeyRepository,
+				labelKeyRunnerScaleSetName,
+				labelKeyRunnerScaleSetNamespace,
+			},
+		},
+		MetricDesiredRunners: {
+			Labels: []string{
+				labelKeyEnterprise,
+				labelKeyOrganization,
+				labelKeyRepository,
+				labelKeyRunnerScaleSetName,
+				labelKeyRunnerScaleSetNamespace,
+			},
+		},
+		MetricIdleRunners: {
+			Labels: []string{
+				labelKeyEnterprise,
+				labelKeyOrganization,
+				labelKeyRepository,
+				labelKeyRunnerScaleSetName,
+				labelKeyRunnerScaleSetNamespace,
+			},
+		},
+	},
+	Histograms: map[string]*v1alpha1.HistogramMetric{
+		MetricJobStartupDurationSeconds: {
+			Labels: []string{
+				labelKeyEnterprise,
+				labelKeyOrganization,
+				labelKeyRepository,
+				labelKeyJobName,
+				labelKeyEventName,
+			},
+			Buckets: defaultRuntimeBuckets,
+		},
+		MetricJobExecutionDurationSeconds: {
+			Labels: []string{
+				labelKeyEnterprise,
+				labelKeyOrganization,
+				labelKeyRepository,
+				labelKeyJobName,
+				labelKeyEventName,
+				labelKeyJobResult,
+			},
+			Buckets: defaultRuntimeBuckets,
+		},
+	},
+}
+
+func (e *ExporterConfig) defaults() {
+	if e.ServerAddr == "" {
+		e.ServerAddr = ":8080"
+	}
+	if e.ServerEndpoint == "" {
+		e.ServerEndpoint = "/metrics"
+	}
+	if e.Metrics == nil {
+		defaultMetrics := defaultMetrics
+		e.Metrics = &defaultMetrics
+	}
 }
 
 func NewExporter(config ExporterConfig) ServerExporter {
+	config.defaults()
 	reg := prometheus.NewRegistry()
 
-	metrics := installMetrics(config.Metrics, reg, config.Logger)
+	metrics := installMetrics(*config.Metrics, reg, config.Logger)
 
 	mux := http.NewServeMux()
 	mux.Handle(
