@@ -15,6 +15,7 @@ import (
 	"github.com/google/go-github/v52/github"
 	"github.com/onsi/gomega"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/mod/modfile"
 	"golang.org/x/oauth2"
 	"sigs.k8s.io/yaml"
 )
@@ -36,8 +37,8 @@ var (
 
 	testResultCMNamePrefix = "test-result-"
 
-	RunnerVersion               = "2.323.0"
-	RunnerContainerHooksVersion = "0.6.2"
+	RunnerVersion               = "2.337.0"
+	RunnerContainerHooksVersion = "0.8.1"
 )
 
 // If you're willing to run this test via VS Code "run test" or "debug test",
@@ -455,7 +456,7 @@ func buildVars(repo, ubuntuVer string) vars {
 		runnerRootlessDindImage     = testing.Img(runnerRootlessDindImageRepo, runnerImageTag)
 
 		dindSidecarImageRepo = "docker"
-		dindSidecarImageTag  = "24.0.7-dind"
+		dindSidecarImageTag  = "28.0.4-dind"
 		dindSidecarImage     = testing.Img(dindSidecarImageRepo, dindSidecarImageTag)
 	)
 
@@ -783,26 +784,30 @@ func (e *env) installActionsRunnerController(t *testing.T, repo, tag, testID, ch
 	}
 
 	if e.useApp {
-		varEnv = append(varEnv,
+		varEnv = append(
+			varEnv,
 			"ACCEPTANCE_TEST_SECRET_TYPE=app",
 			"APP_ID="+e.appID,
 			"APP_INSTALLATION_ID="+e.appInstallationID,
 			"APP_PRIVATE_KEY_FILE="+e.appPrivateKeyFile,
 		)
 	} else {
-		varEnv = append(varEnv,
+		varEnv = append(
+			varEnv,
 			"ACCEPTANCE_TEST_SECRET_TYPE=token",
 			"GITHUB_TOKEN="+e.githubToken,
 		)
 	}
 
 	if e.logFormat != "" {
-		varEnv = append(varEnv,
+		varEnv = append(
+			varEnv,
 			"LOG_FORMAT="+e.logFormat,
 		)
 	}
 
-	varEnv = append(varEnv,
+	varEnv = append(
+		varEnv,
 		"GITHUB_WEBHOOK_SERVER_ENV_NAME="+c.GithubWebhookServerEnvName,
 		"GITHUB_WEBHOOK_SERVER_ENV_VALUE="+c.GithubWebhookServerEnvValue,
 	)
@@ -909,20 +914,24 @@ func (e *env) do(t *testing.T, op string, kind DeployKind, testID string, env ..
 	}
 
 	if e.dockerdWithinRunnerContainer {
-		varEnv = append(varEnv,
+		varEnv = append(
+			varEnv,
 			"RUNNER_DOCKERD_WITHIN_RUNNER_CONTAINER=true",
 		)
 		if e.rootlessDocker {
-			varEnv = append(varEnv,
+			varEnv = append(
+				varEnv,
 				"RUNNER_NAME="+e.vars.runnerRootlessDindImageRepo,
 			)
 		} else {
-			varEnv = append(varEnv,
+			varEnv = append(
+				varEnv,
 				"RUNNER_NAME="+e.vars.runnerDindImageRepo,
 			)
 		}
 	} else {
-		varEnv = append(varEnv,
+		varEnv = append(
+			varEnv,
 			"RUNNER_DOCKERD_WITHIN_RUNNER_CONTAINER=false",
 			"RUNNER_NAME="+e.vars.runnerImageRepo,
 		)
@@ -1010,7 +1019,7 @@ type job struct {
 func createTestJobs(id, testResultCMNamePrefix string, numJobs int) []job {
 	var testJobs []job
 
-	for i := 0; i < numJobs; i++ {
+	for i := range numJobs {
 		name := fmt.Sprintf("test%d", i)
 		testArg := fmt.Sprintf("%s%d", id, i)
 		configMapName := testResultCMNamePrefix + testArg
@@ -1042,10 +1051,11 @@ func installActionsWorkflow(t *testing.T, testName, runnerLabel, testResultCMNam
 	}
 
 	kubernetesContainerMode := os.Getenv("TEST_CONTAINER_MODE") == "kubernetes"
+	goVersion := goVersionFromGoMod(t)
 
 	var container string
 	if kubernetesContainerMode {
-		container = "golang:1.24"
+		container = "golang:" + goVersion
 	}
 
 	for _, j := range testJobs {
@@ -1062,14 +1072,16 @@ func installActionsWorkflow(t *testing.T, testName, runnerLabel, testResultCMNam
 
 		if !kubernetesContainerMode {
 			if kind == RunnerDeployments {
-				steps = append(steps,
+				steps = append(
+					steps,
 					testing.Step{
 						Run: sudo + "mkdir -p \"${RUNNER_TOOL_CACHE}\" \"${HOME}/.cache\"",
 					},
 				)
 
 				if useSudo {
-					steps = append(steps,
+					steps = append(
+						steps,
 						testing.Step{
 							// This might be the easiest way to handle permissions without use of securityContext
 							// https://stackoverflow.com/questions/50156124/kubernetes-nfs-persistent-volumes-permission-denied#comment107483717_53186320
@@ -1080,7 +1092,8 @@ func installActionsWorkflow(t *testing.T, testName, runnerLabel, testResultCMNam
 			}
 
 			if useSudo {
-				steps = append(steps,
+				steps = append(
+					steps,
 					testing.Step{
 						// This might be the easiest way to handle permissions without use of securityContext
 						// https://stackoverflow.com/questions/50156124/kubernetes-nfs-persistent-volumes-permission-denied#comment107483717_53186320
@@ -1102,18 +1115,20 @@ func installActionsWorkflow(t *testing.T, testName, runnerLabel, testResultCMNam
 				)
 			}
 
-			steps = append(steps,
+			steps = append(
+				steps,
 				testing.Step{
 					Uses: "actions/setup-go@v3",
 					With: &testing.With{
-						GoVersion: "1.24.0",
+						GoVersion: goVersion,
 					},
 				},
 			)
 
 			// Ensure both the alias and the full command work after
 			// https://github.com/actions/actions-runner-controller/pull/2326
-			steps = append(steps,
+			steps = append(
+				steps,
 				testing.Step{
 					Run: "docker-compose version",
 				},
@@ -1123,7 +1138,8 @@ func installActionsWorkflow(t *testing.T, testName, runnerLabel, testResultCMNam
 			)
 		}
 
-		steps = append(steps,
+		steps = append(
+			steps,
 			testing.Step{
 				Run: "go version",
 			},
@@ -1166,19 +1182,21 @@ func installActionsWorkflow(t *testing.T, testName, runnerLabel, testResultCMNam
 				if useCustomDockerContext {
 					setupBuildXActionWith.Endpoint = "mycontext"
 
-					steps = append(steps, testing.Step{
-						// https://github.com/docker/buildx/issues/413#issuecomment-710660155
-						// To prevent setup-buildx-action from failing with:
-						//   error: could not create a builder instance with TLS data loaded from environment. Please use `docker context create <context-name>` to create a context for current environment and then create a builder instance with `docker buildx create <context-name>`
-						Run: "docker context create mycontext",
-					},
+					steps = append(
+						steps, testing.Step{
+							// https://github.com/docker/buildx/issues/413#issuecomment-710660155
+							// To prevent setup-buildx-action from failing with:
+							//   error: could not create a builder instance with TLS data loaded from environment. Please use `docker context create <context-name>` to create a context for current environment and then create a builder instance with `docker buildx create <context-name>`
+							Run: "docker context create mycontext",
+						},
 						testing.Step{
 							Run: "docker context use mycontext",
 						},
 					)
 				}
 
-				steps = append(steps,
+				steps = append(
+					steps,
 					testing.Step{
 						Name: "Set up Docker Buildx",
 						Uses: "docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2",
@@ -1203,7 +1221,8 @@ func installActionsWorkflow(t *testing.T, testName, runnerLabel, testResultCMNam
 				)
 
 				if useSudo {
-					steps = append(steps,
+					steps = append(
+						steps,
 						testing.Step{
 							// https://github.com/docker/build-push-action/blob/master/docs/advanced/cache.md#local-cache
 							// See https://github.com/moby/buildkit/issues/1896 for why this is needed
@@ -1218,7 +1237,8 @@ func installActionsWorkflow(t *testing.T, testName, runnerLabel, testResultCMNam
 
 			if useSudo {
 				if kind == RunnerDeployments {
-					steps = append(steps,
+					steps = append(
+						steps,
 						testing.Step{
 							// https://github.com/docker/build-push-action/blob/master/docs/advanced/cache.md#local-cache
 							// See https://github.com/moby/buildkit/issues/1896 for why this is needed
@@ -1232,7 +1252,8 @@ func installActionsWorkflow(t *testing.T, testName, runnerLabel, testResultCMNam
 			}
 		}
 
-		steps = append(steps,
+		steps = append(
+			steps,
 			testing.Step{
 				Uses: "azure/setup-kubectl@3e0aec4d80787158d308d7b364cb1b702e7feb7f",
 				With: &testing.With{
@@ -1279,6 +1300,33 @@ kubectl create cm %s$id --from-literal=status=ok
 	if err := g.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// goVersionFromGoMod keeps the runner-side Go toolchain in sync with go.mod so
+// the version is pinned in exactly one place. Like setup-go's go-version-file,
+// the toolchain directive wins over the go directive when both are present.
+func goVersionFromGoMod(t *testing.T) string {
+	t.Helper()
+
+	data, err := os.ReadFile(filepath.Join("..", "..", "go.mod"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := modfile.ParseLax("go.mod", data, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if f.Toolchain != nil {
+		return strings.TrimPrefix(f.Toolchain.Name, "go")
+	}
+
+	if f.Go == nil {
+		t.Fatal("go.mod has no go directive")
+	}
+
+	return f.Go.Version
 }
 
 func verifyActionsWorkflowRun(t *testing.T, ctx context.Context, env *testing.Env, testJobs []job, timeout time.Duration, cmCfg testing.KubectlConfig) {

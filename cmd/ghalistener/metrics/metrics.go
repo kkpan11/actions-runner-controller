@@ -2,14 +2,13 @@ package metrics
 
 import (
 	"context"
-	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/actions/actions-runner-controller/apis/actions.github.com/v1alpha1"
-	"github.com/actions/actions-runner-controller/github/actions"
-	"github.com/go-logr/logr"
+	"github.com/actions/scaleset"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -21,6 +20,9 @@ const (
 	labelKeyOrganization            = "organization"
 	labelKeyRepository              = "repository"
 	labelKeyJobName                 = "job_name"
+	labelKeyJobWorkflowRef          = "job_workflow_ref"
+	labelKeyJobWorkflowName         = "job_workflow_name"
+	labelKeyJobWorkflowTarget       = "job_workflow_target"
 	labelKeyEventName               = "event_name"
 	labelKeyJobResult               = "job_result"
 )
@@ -73,50 +75,52 @@ var metricsHelp = metricsHelpRegistry{
 	},
 }
 
-func (e *exporter) jobLabels(jobBase *actions.JobMessageBase) prometheus.Labels {
+func (e *exporter) jobLabels(jobBase *scaleset.JobMessageBase) prometheus.Labels {
+	workflowRefInfo := ParseWorkflowRef(jobBase.JobWorkflowRef)
 	return prometheus.Labels{
-		labelKeyEnterprise:   e.scaleSetLabels[labelKeyEnterprise],
-		labelKeyOrganization: jobBase.OwnerName,
-		labelKeyRepository:   jobBase.RepositoryName,
-		labelKeyJobName:      jobBase.JobDisplayName,
-		labelKeyEventName:    jobBase.EventName,
+		labelKeyEnterprise:        e.scaleSetLabels[labelKeyEnterprise],
+		labelKeyOrganization:      jobBase.OwnerName,
+		labelKeyRepository:        jobBase.RepositoryName,
+		labelKeyJobName:           jobBase.JobDisplayName,
+		labelKeyJobWorkflowRef:    jobBase.JobWorkflowRef,
+		labelKeyJobWorkflowName:   workflowRefInfo.Name,
+		labelKeyJobWorkflowTarget: workflowRefInfo.Target,
+		labelKeyEventName:         jobBase.EventName,
 	}
 }
 
-func (e *exporter) completedJobLabels(msg *actions.JobCompleted) prometheus.Labels {
+func (e *exporter) completedJobLabels(msg *scaleset.JobCompleted) prometheus.Labels {
 	l := e.jobLabels(&msg.JobMessageBase)
 	l[labelKeyJobResult] = msg.Result
 	return l
 }
 
-func (e *exporter) startedJobLabels(msg *actions.JobStarted) prometheus.Labels {
+func (e *exporter) startedJobLabels(msg *scaleset.JobStarted) prometheus.Labels {
 	return e.jobLabels(&msg.JobMessageBase)
 }
 
-//go:generate mockery --name Publisher --output ./mocks --outpkg mocks --case underscore
-type Publisher interface {
-	PublishStatic(min, max int)
-	PublishStatistics(stats *actions.RunnerScaleSetStatistic)
-	PublishJobStarted(msg *actions.JobStarted)
-	PublishJobCompleted(msg *actions.JobCompleted)
-	PublishDesiredRunners(count int)
+type Recorder interface {
+	RecordStatic(min, max int)
+	RecordStatistics(stats *scaleset.RunnerScaleSetStatistic)
+	RecordJobStarted(msg *scaleset.JobStarted)
+	RecordJobCompleted(msg *scaleset.JobCompleted)
+	RecordDesiredRunners(count int)
 }
 
-//go:generate mockery --name ServerPublisher --output ./mocks --outpkg mocks --case underscore
 type ServerExporter interface {
-	Publisher
+	Recorder
 	ListenAndServe(ctx context.Context) error
 }
 
 var (
-	_ Publisher      = &discard{}
+	_ Recorder       = &discard{}
 	_ ServerExporter = &exporter{}
 )
 
-var Discard Publisher = &discard{}
+var Discard Recorder = &discard{}
 
 type exporter struct {
-	logger         logr.Logger
+	logger         *slog.Logger
 	scaleSetLabels prometheus.Labels
 	*metrics
 	srv *http.Server
@@ -151,14 +155,149 @@ type ExporterConfig struct {
 	Repository        string
 	ServerAddr        string
 	ServerEndpoint    string
-	Logger            logr.Logger
-	Metrics           v1alpha1.MetricsConfig
+	Logger            *slog.Logger
+	Metrics           *v1alpha1.MetricsConfig
+}
+
+var defaultMetrics = v1alpha1.MetricsConfig{
+	Counters: map[string]*v1alpha1.CounterMetric{
+		MetricStartedJobsTotal: {
+			Labels: []string{
+				labelKeyEnterprise,
+				labelKeyOrganization,
+				labelKeyRepository,
+				labelKeyJobName,
+				labelKeyEventName,
+			},
+		},
+		MetricCompletedJobsTotal: {
+			Labels: []string{
+				labelKeyEnterprise,
+				labelKeyOrganization,
+				labelKeyRepository,
+				labelKeyJobName,
+				labelKeyEventName,
+				labelKeyJobResult,
+			},
+		},
+	},
+	Gauges: map[string]*v1alpha1.GaugeMetric{
+		MetricAssignedJobs: {
+			Labels: []string{
+				labelKeyEnterprise,
+				labelKeyOrganization,
+				labelKeyRepository,
+				labelKeyRunnerScaleSetName,
+				labelKeyRunnerScaleSetNamespace,
+			},
+		},
+		MetricRunningJobs: {
+			Labels: []string{
+				labelKeyEnterprise,
+				labelKeyOrganization,
+				labelKeyRepository,
+				labelKeyRunnerScaleSetName,
+				labelKeyRunnerScaleSetNamespace,
+			},
+		},
+		MetricRegisteredRunners: {
+			Labels: []string{
+				labelKeyEnterprise,
+				labelKeyOrganization,
+				labelKeyRepository,
+				labelKeyRunnerScaleSetName,
+				labelKeyRunnerScaleSetNamespace,
+			},
+		},
+		MetricBusyRunners: {
+			Labels: []string{
+				labelKeyEnterprise,
+				labelKeyOrganization,
+				labelKeyRepository,
+				labelKeyRunnerScaleSetName,
+				labelKeyRunnerScaleSetNamespace,
+			},
+		},
+		MetricMinRunners: {
+			Labels: []string{
+				labelKeyEnterprise,
+				labelKeyOrganization,
+				labelKeyRepository,
+				labelKeyRunnerScaleSetName,
+				labelKeyRunnerScaleSetNamespace,
+			},
+		},
+		MetricMaxRunners: {
+			Labels: []string{
+				labelKeyEnterprise,
+				labelKeyOrganization,
+				labelKeyRepository,
+				labelKeyRunnerScaleSetName,
+				labelKeyRunnerScaleSetNamespace,
+			},
+		},
+		MetricDesiredRunners: {
+			Labels: []string{
+				labelKeyEnterprise,
+				labelKeyOrganization,
+				labelKeyRepository,
+				labelKeyRunnerScaleSetName,
+				labelKeyRunnerScaleSetNamespace,
+			},
+		},
+		MetricIdleRunners: {
+			Labels: []string{
+				labelKeyEnterprise,
+				labelKeyOrganization,
+				labelKeyRepository,
+				labelKeyRunnerScaleSetName,
+				labelKeyRunnerScaleSetNamespace,
+			},
+		},
+	},
+	Histograms: map[string]*v1alpha1.HistogramMetric{
+		MetricJobStartupDurationSeconds: {
+			Labels: []string{
+				labelKeyEnterprise,
+				labelKeyOrganization,
+				labelKeyRepository,
+				labelKeyJobName,
+				labelKeyEventName,
+			},
+			Buckets: defaultRuntimeBuckets,
+		},
+		MetricJobExecutionDurationSeconds: {
+			Labels: []string{
+				labelKeyEnterprise,
+				labelKeyOrganization,
+				labelKeyRepository,
+				labelKeyJobName,
+				labelKeyEventName,
+				labelKeyJobResult,
+			},
+			Buckets: defaultRuntimeBuckets,
+		},
+	},
+}
+
+func (e *ExporterConfig) defaults() {
+	if e.ServerAddr == "" {
+		e.ServerAddr = ":8080"
+	}
+	if e.ServerEndpoint == "" {
+		e.ServerEndpoint = "/metrics"
+	}
+	if e.Metrics == nil {
+		defaultMetrics := defaultMetrics
+		e.Metrics = &defaultMetrics
+	}
 }
 
 func NewExporter(config ExporterConfig) ServerExporter {
+	config.defaults()
 	reg := prometheus.NewRegistry()
 
-	metrics := installMetrics(config.Metrics, reg, config.Logger)
+	metrics := installMetrics(*config.Metrics, reg, config.Logger)
 
 	mux := http.NewServeMux()
 	mux.Handle(
@@ -167,7 +306,7 @@ func NewExporter(config ExporterConfig) ServerExporter {
 	)
 
 	return &exporter{
-		logger: config.Logger.WithName("metrics"),
+		logger: config.Logger.With("component", "metrics exporter"),
 		scaleSetLabels: prometheus.Labels{
 			labelKeyRunnerScaleSetName:      config.ScaleSetName,
 			labelKeyRunnerScaleSetNamespace: config.ScaleSetNamespace,
@@ -183,9 +322,7 @@ func NewExporter(config ExporterConfig) ServerExporter {
 	}
 }
 
-var errUnknownMetricName = errors.New("unknown metric name")
-
-func installMetrics(config v1alpha1.MetricsConfig, reg *prometheus.Registry, logger logr.Logger) *metrics {
+func installMetrics(config v1alpha1.MetricsConfig, reg *prometheus.Registry, logger *slog.Logger) *metrics {
 	logger.Info(
 		"Registering metrics",
 		"gauges",
@@ -203,7 +340,11 @@ func installMetrics(config v1alpha1.MetricsConfig, reg *prometheus.Registry, log
 	for name, cfg := range config.Gauges {
 		help, ok := metricsHelp.gauges[name]
 		if !ok {
-			logger.Error(errUnknownMetricName, "name", name, "kind", "gauge")
+			logger.Error(
+				"unknown metric name",
+				slog.String("name", name),
+				slog.String("kind", "gauge"),
+			)
 			continue
 		}
 
@@ -225,7 +366,11 @@ func installMetrics(config v1alpha1.MetricsConfig, reg *prometheus.Registry, log
 	for name, cfg := range config.Counters {
 		help, ok := metricsHelp.counters[name]
 		if !ok {
-			logger.Error(errUnknownMetricName, "name", name, "kind", "counter")
+			logger.Error(
+				"unknown metric name",
+				slog.String("name", name),
+				slog.String("kind", "counter"),
+			)
 			continue
 		}
 		c := prometheus.V2.NewCounterVec(prometheus.CounterVecOpts{
@@ -246,7 +391,11 @@ func installMetrics(config v1alpha1.MetricsConfig, reg *prometheus.Registry, log
 	for name, cfg := range config.Histograms {
 		help, ok := metricsHelp.histograms[name]
 		if !ok {
-			logger.Error(errUnknownMetricName, "name", name, "kind", "histogram")
+			logger.Error(
+				"unknown metric name",
+				slog.String("name", name),
+				slog.String("kind", "histogram"),
+			)
 			continue
 		}
 
@@ -322,46 +471,62 @@ func (e *exporter) observeHistogram(name string, allLabels prometheus.Labels, va
 	m.histogram.With(labels).Observe(val)
 }
 
-func (e *exporter) PublishStatic(min, max int) {
+func (e *exporter) RecordStatic(min, max int) {
 	e.setGauge(MetricMaxRunners, e.scaleSetLabels, float64(max))
 	e.setGauge(MetricMinRunners, e.scaleSetLabels, float64(min))
 }
 
-func (e *exporter) PublishStatistics(stats *actions.RunnerScaleSetStatistic) {
+func (e *exporter) RecordStatistics(stats *scaleset.RunnerScaleSetStatistic) {
 	e.setGauge(MetricAssignedJobs, e.scaleSetLabels, float64(stats.TotalAssignedJobs))
 	e.setGauge(MetricRunningJobs, e.scaleSetLabels, float64(stats.TotalRunningJobs))
 	e.setGauge(MetricRegisteredRunners, e.scaleSetLabels, float64(stats.TotalRegisteredRunners))
-	e.setGauge(MetricBusyRunners, e.scaleSetLabels, float64(float64(stats.TotalBusyRunners)))
+	e.setGauge(MetricBusyRunners, e.scaleSetLabels, float64(stats.TotalBusyRunners))
 	e.setGauge(MetricIdleRunners, e.scaleSetLabels, float64(stats.TotalIdleRunners))
 }
 
-func (e *exporter) PublishJobStarted(msg *actions.JobStarted) {
+func (e *exporter) RecordJobStarted(msg *scaleset.JobStarted) {
+	if msg.RunnerAssignTime.IsZero() {
+		return
+	}
+
 	l := e.startedJobLabels(msg)
 	e.incCounter(MetricStartedJobsTotal, l)
+
+	if msg.ScaleSetAssignTime.IsZero() || msg.RunnerAssignTime.Before(msg.ScaleSetAssignTime) {
+		return
+	}
 
 	startupDuration := msg.RunnerAssignTime.Unix() - msg.ScaleSetAssignTime.Unix()
 	e.observeHistogram(MetricJobStartupDurationSeconds, l, float64(startupDuration))
 }
 
-func (e *exporter) PublishJobCompleted(msg *actions.JobCompleted) {
+func (e *exporter) RecordJobCompleted(msg *scaleset.JobCompleted) {
+	if msg.RunnerAssignTime.IsZero() {
+		return
+	}
+
 	l := e.completedJobLabels(msg)
 	e.incCounter(MetricCompletedJobsTotal, l)
 
-	executionDuration := msg.FinishTime.Unix() - msg.RunnerAssignTime.Unix()
-	e.observeHistogram(MetricJobExecutionDurationSeconds, l, float64(executionDuration))
+	if msg.FinishTime.IsZero() || msg.FinishTime.Before(msg.RunnerAssignTime) {
+		return
+	}
+
+	finishDuration := msg.FinishTime.Unix() - msg.RunnerAssignTime.Unix()
+	e.observeHistogram(MetricJobExecutionDurationSeconds, l, float64(finishDuration))
 }
 
-func (e *exporter) PublishDesiredRunners(count int) {
+func (e *exporter) RecordDesiredRunners(count int) {
 	e.setGauge(MetricDesiredRunners, e.scaleSetLabels, float64(count))
 }
 
 type discard struct{}
 
-func (*discard) PublishStatic(int, int)                             {}
-func (*discard) PublishStatistics(*actions.RunnerScaleSetStatistic) {}
-func (*discard) PublishJobStarted(*actions.JobStarted)              {}
-func (*discard) PublishJobCompleted(*actions.JobCompleted)          {}
-func (*discard) PublishDesiredRunners(int)                          {}
+func (*discard) RecordStatic(int, int)                              {}
+func (*discard) RecordStatistics(*scaleset.RunnerScaleSetStatistic) {}
+func (*discard) RecordJobStarted(*scaleset.JobStarted)              {}
+func (*discard) RecordJobCompleted(*scaleset.JobCompleted)          {}
+func (*discard) RecordDesiredRunners(int)                           {}
 
 var defaultRuntimeBuckets []float64 = []float64{
 	0.01,
