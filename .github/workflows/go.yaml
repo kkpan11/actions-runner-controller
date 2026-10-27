@@ -5,15 +5,20 @@ on:
       - master
     paths:
       - ".github/workflows/go.yaml"
+      - "charts/gha-runner-scale-set*/**"
       - "**.go"
       - "go.mod"
       - "go.sum"
   pull_request:
     paths:
       - ".github/workflows/go.yaml"
+      - "charts/gha-runner-scale-set*/**"
       - "**.go"
       - "go.mod"
       - "go.sum"
+
+env:
+  HELM_VERSION: v4.2.2
 
 permissions:
   contents: read
@@ -29,8 +34,8 @@ jobs:
   fmt:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: "go.mod"
           cache: false
@@ -42,23 +47,22 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: "go.mod"
           cache: false
       - name: golangci-lint
-        # https://github.com/golangci/golangci-lint-action/releases/tag/v7.0.0
-        uses: golangci/golangci-lint-action@1481404843c368bc19ca9406f87d6e0fc97bdcfd
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a
         with:
           only-new-issues: true
-          version: v2.1.2
+          version: v2.15.0
 
   generate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: "go.mod"
           cache: false
@@ -67,23 +71,37 @@ jobs:
       - name: Check diff
         run: git diff --exit-code
 
+  mocks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: "go.mod"
+          cache: false
+      - name: "Run mockery"
+        run: go tool github.com/vektra/mockery/v3
+      - name: Check diff
+        run: git diff --exit-code
+
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: "go.mod"
+      - name: Set up Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310
+        with:
+          version: ${{ env.HELM_VERSION }}
       - run: make manifests
       - name: Check diff
         run: git diff --exit-code
-      - name: Install kubebuilder
+      - name: Setup envtest
         run: |
-          curl -D headers.txt -fsL "https://storage.googleapis.com/kubebuilder-tools/kubebuilder-tools-1.26.1-linux-amd64.tar.gz" -o kubebuilder-tools
-          echo "$(grep -i etag headers.txt -m 1 | cut -d'"' -f2) kubebuilder-tools" > sum
-          md5sum -c sum
-          tar -zvxf kubebuilder-tools
-          sudo mv kubebuilder /usr/local/
+          ENVTEST_K8S_VERSION=$(go list -m -f '{{ .Version }}' k8s.io/api | awk -F'[v.]' '{printf "1.%d", $3}')
+          echo "KUBEBUILDER_ASSETS=$(go tool sigs.k8s.io/controller-runtime/tools/setup-envtest use ${ENVTEST_K8S_VERSION} -p path)" >> $GITHUB_ENV
       - name: Run go tests
         run: |
           go test -short `go list ./... | grep -v ./test_e2e_arc`

@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/onsi/ginkgo/config"
 
@@ -79,6 +80,20 @@ var _ = BeforeSuite(func() {
 	k8sClient, err = client.New(cfg, client.Options{Scheme: scheme.Scheme})
 	Expect(err).ToNot(HaveOccurred())
 	Expect(k8sClient).ToNot(BeNil())
+
+	failedRunnerBackoff = []time.Duration{
+		20 * time.Millisecond,
+		20 * time.Millisecond,
+		20 * time.Millisecond,
+		20 * time.Millisecond,
+		20 * time.Millisecond,
+		20 * time.Millisecond,
+	}
+
+	// Most specs run the set controller without the runner controller, so a
+	// runner records its ID only if the spec patches it in. Cleanup would sit
+	// out the grace period on every other one.
+	unrecordedRunnerIDGracePeriod = 0
 })
 
 var _ = AfterSuite(func() {

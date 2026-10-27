@@ -28,19 +28,24 @@ import (
 	"github.com/actions/actions-runner-controller/build"
 	actionsgithubcom "github.com/actions/actions-runner-controller/controllers/actions.github.com"
 	actionsgithubcommetrics "github.com/actions/actions-runner-controller/controllers/actions.github.com/metrics"
+	"github.com/actions/actions-runner-controller/controllers/actions.github.com/multiclient"
+	"github.com/actions/actions-runner-controller/controllers/actions.github.com/secretresolver"
 	actionssummerwindnet "github.com/actions/actions-runner-controller/controllers/actions.summerwind.net"
 	"github.com/actions/actions-runner-controller/github"
-	"github.com/actions/actions-runner-controller/github/actions"
+	"github.com/actions/actions-runner-controller/logger"
 	"github.com/actions/actions-runner-controller/logging"
 	"github.com/kelseyhightower/envconfig"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
+	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	// +kubebuilder:scaffold:imports
 )
@@ -81,11 +86,12 @@ func main() {
 		listenerMetricsEndpoint string
 
 		metricsAddr              string
+		pprofAddr                string
+		probeAddr                string
 		autoScalingRunnerSetOnly bool
 		enableLeaderElection     bool
 		disableAdmissionWebhook  bool
-		updateStrategy           string
-		leaderElectionId         string
+		leaderElectionID         string
 		port                     int
 		syncPeriod               time.Duration
 
@@ -108,6 +114,10 @@ func main() {
 
 		k8sClientRateLimiterQPS   int
 		k8sClientRateLimiterBurst int
+
+		terminatedRunnerPodGracePeriodSeconds int64
+
+		workqueueRateLimiter string
 	)
 	var c github.Config
 	err = envconfig.Process("github", &c)
@@ -119,12 +129,14 @@ func main() {
 	flag.StringVar(&listenerMetricsAddr, "listener-metrics-addr", ":8080", "The address applied to AutoscalingListener metrics server")
 	flag.StringVar(&listenerMetricsEndpoint, "listener-metrics-endpoint", "/metrics", "The AutoscalingListener metrics server endpoint from which the metrics are collected")
 	flag.StringVar(&metricsAddr, "metrics-addr", ":8080", "The address the metric endpoint binds to.")
+	flag.StringVar(&pprofAddr, "pprof-addr", "", "The address the pprof endpoint binds to.")
+	flag.StringVar(&probeAddr, "health-probe-bind-address", "", "The address the health probe endpoint binds to. Disabled if empty.")
 	flag.BoolVar(&enableLeaderElection, "enable-leader-election", false,
 		"Enable leader election for controller manager. Enabling this will ensure there is only one active controller manager.")
-	flag.StringVar(&leaderElectionId, "leader-election-id", "actions-runner-controller", "Controller id for leader election.")
+	flag.StringVar(&leaderElectionID, "leader-election-id", "actions-runner-controller", "Controller id for leader election.")
 	flag.StringVar(&runnerPodDefaults.RunnerImage, "runner-image", defaultRunnerImage, "The image name of self-hosted runner container to use by default if one isn't defined in yaml.")
 	flag.StringVar(&runnerPodDefaults.DockerImage, "docker-image", defaultDockerImage, "The image name of docker sidecar container to use by default if one isn't defined in yaml.")
-	flag.StringVar(&runnerPodDefaults.DockerGID, "docker-gid", defaultDockerGID, "The default GID of docker group in the docker sidecar container. Use 1001 for dockerd sidecars of Ubuntu 20.04 runners 121 for Ubuntu 22.04.")
+	flag.StringVar(&runnerPodDefaults.DockerGID, "docker-gid", defaultDockerGID, "The default GID of docker group in the docker sidecar container. Use 1001 for dockerd sidecars of Ubuntu 20.04 runners 121 for Ubuntu 22.04 and 24.04.")
 	flag.Var(&runnerImagePullSecrets, "runner-image-pull-secret", "The default image-pull secret name for self-hosted runner container.")
 	flag.StringVar(&runnerPodDefaults.DockerRegistryMirror, "docker-registry-mirror", "", "The default Docker Registry Mirror used by runners.")
 	flag.StringVar(&c.Token, "github-token", c.Token, "The personal access token of GitHub.")
@@ -141,7 +153,10 @@ func main() {
 	flag.DurationVar(&defaultScaleDownDelay, "default-scale-down-delay", actionssummerwindnet.DefaultScaleDownDelay, "The approximate delay for a scale down followed by a scale up, used to prevent flapping (down->up->down->... loop)")
 	flag.IntVar(&port, "port", 9443, "The port to which the admission webhook endpoint should bind")
 	flag.DurationVar(&syncPeriod, "sync-period", 1*time.Minute, "Determines the minimum frequency at which K8s resources managed by this controller are reconciled.")
-	flag.IntVar(&opts.RunnerMaxConcurrentReconciles, "runner-max-concurrent-reconciles", opts.RunnerMaxConcurrentReconciles, "The maximum number of concurrent reconciles which can be run by the EphemeralRunner controller. Increase this value to improve the throughput of the controller, but it may also increase the load on the API server and the external service (e.g. GitHub API).")
+	flag.IntVar(&opts.AutoscalingRunnerSetMaxConcurrentReconciles, "autoscaling-runner-set-max-concurrent-reconciles", opts.AutoscalingRunnerSetMaxConcurrentReconciles, "The maximum number of concurrent reconciles which can be run by the AutoscalingRunnerSet controller. Increase this value to improve throughput when running many runner scale sets, at the cost of more load on the API server and the external service (e.g. GitHub API).")
+	flag.IntVar(&opts.AutoscalingListenerMaxConcurrentReconciles, "autoscaling-listener-max-concurrent-reconciles", opts.AutoscalingListenerMaxConcurrentReconciles, "The maximum number of concurrent reconciles which can be run by the AutoscalingListener controller. Increase this value to improve throughput when running many runner scale sets, at the cost of more load on the API server and the external service (e.g. GitHub API).")
+	flag.IntVar(&opts.EphemeralRunnerSetMaxConcurrentReconciles, "ephemeral-runner-set-max-concurrent-reconciles", opts.EphemeralRunnerSetMaxConcurrentReconciles, "The maximum number of concurrent reconciles which can be run by the EphemeralRunnerSet controller. Increase this value to improve throughput when running many runner scale sets, at the cost of more load on the API server and the external service (e.g. GitHub API).")
+	flag.IntVar(&opts.EphemeralRunnerMaxConcurrentReconciles, "ephemeral-runner-max-concurrent-reconciles", opts.EphemeralRunnerMaxConcurrentReconciles, "The maximum number of concurrent reconciles which can be run by the EphemeralRunner controller. Increase this value to improve runner provisioning and cleanup throughput, at the cost of more load on the API server and the external service (e.g. GitHub API).")
 	flag.Var(&commonRunnerLabels, "common-runner-labels", "Runner labels in the K1=V1,K2=V2,... format that are inherited all the runners created by the controller. See https://github.com/actions/actions-runner-controller/issues/321 for more information")
 	flag.StringVar(&namespace, "watch-namespace", "", "The namespace to watch for custom resources. Set to empty for letting it watch for all namespaces.")
 	flag.StringVar(&watchSingleNamespace, "watch-single-namespace", "", "Restrict to watch for custom resources in a single namespace.")
@@ -149,12 +164,14 @@ func main() {
 	flag.StringVar(&logLevel, "log-level", logging.LogLevelDebug, `The verbosity of the logging. Valid values are "debug", "info", "warn", "error". Defaults to "debug".`)
 	flag.StringVar(&logFormat, "log-format", "text", `The log format. Valid options are "text" and "json". Defaults to "text"`)
 	flag.BoolVar(&autoScalingRunnerSetOnly, "auto-scaling-runner-set-only", false, "Make controller only reconcile AutoRunnerScaleSet object.")
-	flag.StringVar(&updateStrategy, "update-strategy", "immediate", `Resources reconciliation strategy on upgrade with running/pending jobs. Valid values are: "immediate", "eventual". Defaults to "immediate".`)
 	flag.Var(&autoScalerImagePullSecrets, "auto-scaler-image-pull-secrets", "The default image-pull secret name for auto-scaler listener container.")
 	flag.IntVar(&k8sClientRateLimiterQPS, "k8s-client-rate-limiter-qps", 20, "The QPS value of the K8s client rate limiter.")
 	flag.IntVar(&k8sClientRateLimiterBurst, "k8s-client-rate-limiter-burst", 30, "The burst value of the K8s client rate limiter.")
+	flag.StringVar(&workqueueRateLimiter, "workqueue-rate-limiter", "", `The workqueue rate limiter to use. Valid values are "bucket_rate_limiter" (default) and "typed_rate_limiter" (per-item only, no global token bucket).`)
+	flag.Int64Var(&terminatedRunnerPodGracePeriodSeconds, "terminated-runner-pod-grace-period-seconds", 0, "The grace period used when deleting a runner pod whose containers have all exited. Zero, the default, removes the pod from the API as soon as its job is over instead of leaving it Terminating while the kubelet cleans up locally, so the runner replacing it can start right away. A negative value leaves the pod's own terminationGracePeriodSeconds in charge. Pods that are still running are always deleted gracefully.")
 	flag.Parse()
 
+	opts = opts.Resolve()
 	runnerPodDefaults.RunnerImagePullSecrets = runnerImagePullSecrets
 
 	log, err := logging.NewLogger(logLevel, logFormat)
@@ -164,7 +181,13 @@ func main() {
 	}
 	c.Log = &log
 
-	log.Info("Using options", "runner-max-concurrent-reconciles", opts.RunnerMaxConcurrentReconciles)
+	log.Info("Using options",
+		"autoscaling-runner-set-max-concurrent-reconciles", opts.AutoscalingRunnerSetMaxConcurrentReconciles,
+		"autoscaling-listener-max-concurrent-reconciles", opts.AutoscalingListenerMaxConcurrentReconciles,
+		"ephemeral-runner-set-max-concurrent-reconciles", opts.EphemeralRunnerSetMaxConcurrentReconciles,
+		"ephemeral-runner-max-concurrent-reconciles", opts.EphemeralRunnerMaxConcurrentReconciles,
+		"terminated-runner-pod-grace-period-seconds", terminatedRunnerPodGracePeriodSeconds,
+	)
 
 	if !autoScalingRunnerSetOnly {
 		ghClient, err = c.NewClient()
@@ -199,14 +222,6 @@ func main() {
 			defaultNamespaces[watchSingleNamespace] = cache.Config{}
 			defaultNamespaces[managerNamespace] = cache.Config{}
 		}
-
-		switch updateStrategy {
-		case "eventual", "immediate":
-			log.Info(`Update strategy set to:`, "updateStrategy", updateStrategy)
-		default:
-			log.Info(`Update strategy not recognized. Defaulting to "immediately"`, "updateStrategy", updateStrategy)
-			updateStrategy = "immediate"
-		}
 	}
 
 	if actionsgithubcom.SetListenerLoggingParameters(logLevel, logFormat) {
@@ -216,6 +231,7 @@ func main() {
 	}
 
 	actionsgithubcom.SetListenerEntrypoint(os.Getenv("LISTENER_ENTRYPOINT"))
+	resourceCache := actionsgithubcom.NewResourceCache()
 
 	var webhookServer webhook.Server
 	if port != 0 {
@@ -237,9 +253,11 @@ func main() {
 			SyncPeriod:        &syncPeriod,
 			DefaultNamespaces: defaultNamespaces,
 		},
-		WebhookServer:    webhookServer,
-		LeaderElection:   enableLeaderElection,
-		LeaderElectionID: leaderElectionId,
+		PprofBindAddress:       pprofAddr,
+		WebhookServer:          webhookServer,
+		HealthProbeBindAddress: probeAddr,
+		LeaderElection:         enableLeaderElection,
+		LeaderElectionID:       leaderElectionID,
 		Client: client.Options{
 			Cache: &client.CacheOptions{
 				DisableFor: []client.Object{
@@ -254,6 +272,17 @@ func main() {
 		os.Exit(1)
 	}
 
+	if probeAddr != "" {
+		if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
+			log.Error(err, "unable to set up health check")
+			os.Exit(1)
+		}
+		if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
+			log.Error(err, "unable to set up ready check")
+			os.Exit(1)
+		}
+	}
+
 	if autoScalingRunnerSetOnly {
 		if err := actionsgithubcom.SetupIndexers(mgr); err != nil {
 			log.Error(err, "unable to setup indexers")
@@ -265,65 +294,118 @@ func main() {
 			os.Exit(1)
 		}
 
-		if metricsAddr != "" {
+		// controller-runtime only skips its metrics server when BindAddress is
+		// "0"; an empty address falls back to ":8080". Register and publish
+		// under the same rule so a live endpoint never misses the scale set
+		// metrics and a disabled one never accumulates unregistered series.
+		metricsEnabled := metricsAddr != "0"
+		if metricsEnabled {
 			log.Info("Registering scale set metrics")
 			actionsgithubcommetrics.RegisterMetrics()
 		}
 
-		actionsMultiClient := actions.NewMultiClient(
-			log.WithName("actions-clients"),
+		slogLogger, err := logger.New(logLevel, logFormat)
+		if err != nil {
+			log.Error(err, "unable to create logger for secret resolver")
+			os.Exit(1)
+		}
+
+		scalesetMultiClient := multiclient.NewScaleset()
+
+		secretResolver := secretresolver.New(
+			mgr.GetClient(),
+			scalesetMultiClient,
+			secretresolver.WithLogger(slogLogger),
 		)
 
 		rb := actionsgithubcom.ResourceBuilder{
 			ExcludeLabelPropagationPrefixes: excludeLabelPropagationPrefixes,
+			SecretResolver:                  secretResolver,
+			Scheme:                          mgr.GetScheme(),
+			ResourceCache:                   &resourceCache,
 		}
 
+		log.Info("Resource builder initializing")
+
+		var controllerOpts []actionsgithubcom.Option
+		switch workqueueRateLimiter {
+		case "typed_rate_limiter":
+			log.Info("Using typed rate limiter (per-item only, no global token bucket)")
+			controllerOpts = append(
+				controllerOpts,
+				actionsgithubcom.WithTypedRateLimiter(workqueue.DefaultTypedItemBasedRateLimiter[reconcile.Request]()),
+			)
+		case "bucket_rate_limiter", "":
+			log.Info("Using default bucket rate limiter")
+		default:
+			log.Error(fmt.Errorf("unknown workqueue rate limiter: %s", workqueueRateLimiter), "invalid --workqueue-rate-limiter value")
+			os.Exit(1)
+		}
+
+		autoscalingRunnerSetOpts := append(controllerOpts, actionsgithubcom.WithMaxConcurrentReconciles(opts.AutoscalingRunnerSetMaxConcurrentReconciles))
 		if err = (&actionsgithubcom.AutoscalingRunnerSetReconciler{
 			Client:                             mgr.GetClient(),
 			Log:                                log.WithName("AutoscalingRunnerSet").WithValues("version", build.Version),
 			Scheme:                             mgr.GetScheme(),
 			ControllerNamespace:                managerNamespace,
 			DefaultRunnerScaleSetListenerImage: managerImage,
-			ActionsClient:                      actionsMultiClient,
-			UpdateStrategy:                     actionsgithubcom.UpdateStrategy(updateStrategy),
 			DefaultRunnerScaleSetListenerImagePullSecrets: autoScalerImagePullSecrets,
 			ResourceBuilder: rb,
-		}).SetupWithManager(mgr); err != nil {
+		}).SetupWithManager(mgr, autoscalingRunnerSetOpts...); err != nil {
 			log.Error(err, "unable to create controller", "controller", "AutoscalingRunnerSet")
 			os.Exit(1)
 		}
 
+		ephemeralRunnerOpts := append(controllerOpts, actionsgithubcom.WithMaxConcurrentReconciles(opts.EphemeralRunnerMaxConcurrentReconciles))
+
+		// Removing a runner registration from the Actions service is not part of
+		// deleting the Kubernetes resources an EphemeralRunner owns, and running
+		// it inline puts local pod cleanup behind an external API. These workers
+		// take it off the reconcile path instead.
+		runnerUnregistrationQueue := actionsgithubcom.NewRunnerUnregistrationQueue(
+			log.WithName("RunnerUnregistration").WithValues("version", build.Version),
+			secretResolver,
+			opts.EphemeralRunnerMaxConcurrentReconciles,
+		)
+		if err := mgr.Add(runnerUnregistrationQueue); err != nil {
+			log.Error(err, "unable to add the runner unregistration workers")
+			os.Exit(1)
+		}
+
 		if err = (&actionsgithubcom.EphemeralRunnerReconciler{
-			Client:          mgr.GetClient(),
-			Log:             log.WithName("EphemeralRunner").WithValues("version", build.Version),
-			Scheme:          mgr.GetScheme(),
-			ActionsClient:   actionsMultiClient,
-			ResourceBuilder: rb,
-		}).SetupWithManager(mgr, actionsgithubcom.WithMaxConcurrentReconciles(opts.RunnerMaxConcurrentReconciles)); err != nil {
+			Client:                          mgr.GetClient(),
+			Log:                             log.WithName("EphemeralRunner").WithValues("version", build.Version),
+			Scheme:                          mgr.GetScheme(),
+			PublishMetrics:                  metricsEnabled,
+			UnregistrationQueue:             runnerUnregistrationQueue,
+			TerminatedPodGracePeriodSeconds: terminatedRunnerPodGracePeriodSeconds,
+			ResourceBuilder:                 rb,
+		}).SetupWithManager(mgr, ephemeralRunnerOpts...); err != nil {
 			log.Error(err, "unable to create controller", "controller", "EphemeralRunner")
 			os.Exit(1)
 		}
 
+		ephemeralRunnerSetOpts := append(controllerOpts, actionsgithubcom.WithMaxConcurrentReconciles(opts.EphemeralRunnerSetMaxConcurrentReconciles))
 		if err = (&actionsgithubcom.EphemeralRunnerSetReconciler{
 			Client:          mgr.GetClient(),
 			Log:             log.WithName("EphemeralRunnerSet").WithValues("version", build.Version),
 			Scheme:          mgr.GetScheme(),
-			ActionsClient:   actionsMultiClient,
-			PublishMetrics:  metricsAddr != "0",
 			ResourceBuilder: rb,
-		}).SetupWithManager(mgr); err != nil {
+		}).SetupWithManager(mgr, ephemeralRunnerSetOpts...); err != nil {
 			log.Error(err, "unable to create controller", "controller", "EphemeralRunnerSet")
 			os.Exit(1)
 		}
 
+		autoscalingListenerOpts := append(controllerOpts, actionsgithubcom.WithMaxConcurrentReconciles(opts.AutoscalingListenerMaxConcurrentReconciles))
 		if err = (&actionsgithubcom.AutoscalingListenerReconciler{
 			Client:                  mgr.GetClient(),
 			Log:                     log.WithName("AutoscalingListener").WithValues("version", build.Version),
 			Scheme:                  mgr.GetScheme(),
 			ListenerMetricsAddr:     listenerMetricsAddr,
 			ListenerMetricsEndpoint: listenerMetricsEndpoint,
+			PublishMetrics:          metricsEnabled,
 			ResourceBuilder:         rb,
-		}).SetupWithManager(mgr); err != nil {
+		}).SetupWithManager(mgr, autoscalingListenerOpts...); err != nil {
 			log.Error(err, "unable to create controller", "controller", "AutoscalingListener")
 			os.Exit(1)
 		}
@@ -393,7 +475,7 @@ func main() {
 			"default-docker-gid", runnerPodDefaults.DockerGID,
 			"common-runnner-labels", commonRunnerLabels,
 			"leader-election-enabled", enableLeaderElection,
-			"leader-election-id", leaderElectionId,
+			"leader-election-id", leaderElectionID,
 			"watch-namespace", namespace,
 		)
 
@@ -483,7 +565,7 @@ func (s *commaSeparatedStringSlice) String() string {
 }
 
 func (s *commaSeparatedStringSlice) Set(value string) error {
-	for _, v := range strings.Split(value, ",") {
+	for v := range strings.SplitSeq(value, ",") {
 		if v == "" {
 			continue
 		}

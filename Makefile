@@ -6,7 +6,7 @@ endif
 DOCKER_USER ?= $(shell echo ${DOCKER_IMAGE_NAME} | cut -d / -f1)
 VERSION ?= dev
 COMMIT_SHA = $(shell git rev-parse HEAD)
-RUNNER_VERSION ?= 2.323.0
+RUNNER_VERSION ?= 2.338.2
 TARGETPLATFORM ?= $(shell arch)
 RUNNER_NAME ?= ${DOCKER_USER}/actions-runner
 RUNNER_TAG  ?= ${VERSION}
@@ -32,21 +32,18 @@ else
 GOBIN=$(shell go env GOBIN)
 endif
 
-TEST_ASSETS=$(PWD)/test-assets
 TOOLS_PATH=$(PWD)/.tools
 
 OS_NAME := $(shell uname -s | tr A-Z a-z)
 
-# The etcd packages that coreos maintain use different extensions for each *nix OS on their github release page.
-# ETCD_EXTENSION: the storage format file extension listed on the release page.
-# EXTRACT_COMMAND: the  appropriate CLI command for extracting this file format.
-ifeq ($(OS_NAME), darwin)
-ETCD_EXTENSION:=zip
-EXTRACT_COMMAND:=unzip
-else
-ETCD_EXTENSION:=tar.gz
-EXTRACT_COMMAND:=tar -xzf
-endif
+# ENVTEST_K8S_VERSION is the version of Kubernetes to use for setting up ENVTEST binaries
+ENVTEST_K8S_VERSION ?= $(shell go list -m -f "{{ .Version }}" k8s.io/api | awk -F'[v.]' '{printf "1.%d", $$3}')
+
+# Tools are declared as `tool` directives in go.mod and executed with `go tool`,
+# so their versions are pinned and updated alongside the rest of the dependencies.
+CONTROLLER_GEN ?= go tool sigs.k8s.io/controller-tools/cmd/controller-gen
+ENVTEST ?= go tool sigs.k8s.io/controller-runtime/tools/setup-envtest
+YQ ?= go tool github.com/mikefarah/yq/v4
 
 # default list of platforms for which multiarch image is built
 ifeq (${PLATFORMS}, )
@@ -68,21 +65,22 @@ endif
 all: manager
 
 lint:
-	docker run --rm -v $(PWD):/app -w /app golangci/golangci-lint:v2.1.2 golangci-lint run
+	docker run --rm -v $(PWD):/app -w /app golangci/golangci-lint:v2.15.0 golangci-lint run
 
 GO_TEST_ARGS ?= -short
 
-# Run tests
-test: generate fmt vet manifests shellcheck
-	go test $(GO_TEST_ARGS) `go list ./... | grep -v ./test_e2e_arc` -coverprofile cover.out
-	go test -fuzz=Fuzz -fuzztime=10s -run=Fuzz* ./controllers/actions.summerwind.net
 
-test-with-deps: kube-apiserver etcd kubectl
-	# See https://pkg.go.dev/sigs.k8s.io/controller-runtime/pkg/envtest#pkg-constants
-	TEST_ASSET_KUBE_APISERVER=$(KUBE_APISERVER_BIN) \
-	TEST_ASSET_ETCD=$(ETCD_BIN) \
-	TEST_ASSET_KUBECTL=$(KUBECTL_BIN) \
+# Run tests
+test: generate fmt vet manifests shellcheck setup-envtest
+	KUBEBUILDER_ASSETS="$$($(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(GOBIN) -p path)" \
+	  go test $(GO_TEST_ARGS) `go list ./... | grep -v ./test_e2e_arc` -coverprofile cover.out
+	KUBEBUILDER_ASSETS="$$($(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(GOBIN) -p path)" \
+	  go test -fuzz=Fuzz -fuzztime=10s -run=Fuzz* ./controllers/actions.summerwind.net
+
+test-with-deps: setup-envtest
+	KUBEBUILDER_ASSETS="$$($(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(GOBIN) -p path)" \
 	  make test
+
 
 # Build manager binary
 manager: generate fmt vet
@@ -115,11 +113,8 @@ deploy: manifests
 # Generate manifests e.g. CRD, RBAC etc.
 manifests: manifests-gen-crds chart-crds
 
-manifests-gen-crds: controller-gen yq
+manifests-gen-crds:
 	$(CONTROLLER_GEN) $(CRD_OPTIONS) rbac:roleName=manager-role webhook paths="./..." output:crd:artifacts:config=config/crd/bases
-	for YAMLFILE in config/crd/bases/actions*.yaml; do \
-		$(YQ) '.spec.preserveUnknownFields = false' --inplace "$$YAMLFILE" ; \
-	done
 	make manifests-gen-crds-fix DELETE_KEY=x-kubernetes-list-type
 	make manifests-gen-crds-fix DELETE_KEY=x-kubernetes-list-map-keys
 
@@ -185,6 +180,10 @@ chart-crds:
 	cp config/crd/bases/actions.github.com_autoscalinglisteners.yaml charts/gha-runner-scale-set-controller/crds/
 	cp config/crd/bases/actions.github.com_ephemeralrunnersets.yaml charts/gha-runner-scale-set-controller/crds/
 	cp config/crd/bases/actions.github.com_ephemeralrunners.yaml charts/gha-runner-scale-set-controller/crds/
+	cp config/crd/bases/actions.github.com_autoscalingrunnersets.yaml charts/gha-runner-scale-set-controller-experimental/crds/
+	cp config/crd/bases/actions.github.com_autoscalinglisteners.yaml charts/gha-runner-scale-set-controller-experimental/crds/
+	cp config/crd/bases/actions.github.com_ephemeralrunnersets.yaml charts/gha-runner-scale-set-controller-experimental/crds/
+	cp config/crd/bases/actions.github.com_ephemeralrunners.yaml charts/gha-runner-scale-set-controller-experimental/crds/
 	rm charts/actions-runner-controller/crds/actions.github.com_autoscalingrunnersets.yaml
 	rm charts/actions-runner-controller/crds/actions.github.com_autoscalinglisteners.yaml
 	rm charts/actions-runner-controller/crds/actions.github.com_ephemeralrunnersets.yaml
@@ -199,7 +198,7 @@ vet:
 	go vet ./...
 
 # Generate code
-generate: controller-gen
+generate:
 	$(CONTROLLER_GEN) object:headerFile=./hack/boilerplate.go.txt paths="./..."
 
 # Run shellcheck on runner scripts
@@ -213,8 +212,6 @@ docker-buildx:
 		docker buildx create --platform ${PLATFORMS} --name container-builder --use;\
 	fi
 	docker buildx build --platform ${PLATFORMS} \
-		--build-arg RUNNER_VERSION=${RUNNER_VERSION} \
-		--build-arg DOCKER_VERSION=${DOCKER_VERSION} \
 		--build-arg VERSION=${VERSION} \
 		--build-arg COMMIT_SHA=${COMMIT_SHA} \
 		-t "${DOCKER_IMAGE_NAME}:${VERSION}" \
@@ -300,51 +297,23 @@ acceptance/runner/startup:
 e2e:
 	go test -count=1 -v -timeout 600s -run '^TestE2E$$' ./test/e2e
 
+.PHONY: gha-e2e
+gha-e2e:
+	bash hack/e2e-test.sh
+
 # Upload release file to GitHub.
 github-release: release
 	ghr ${VERSION} release/
 
-# Find or download controller-gen
+# controller-gen is provided by the `sigs.k8s.io/controller-tools/cmd/controller-gen`
+# tool directive in go.mod, and is invoked through `$(CONTROLLER_GEN)`.
 #
 # Note that controller-gen newer than 0.4.1 is needed for https://github.com/kubernetes-sigs/controller-tools/issues/444#issuecomment-680168439
 # Otherwise we get errors like the below:
 #   Error: failed to install CRD crds/actions.summerwind.dev_runnersets.yaml: CustomResourceDefinition.apiextensions.k8s.io "runnersets.actions.summerwind.dev" is invalid: [spec.validation.openAPIV3Schema.properties[spec].properties[template].properties[spec].properties[containers].items.properties[ports].items.properties[protocol].default: Required value: this property is in x-kubernetes-list-map-keys, so it must have a default or be a required property, spec.validation.openAPIV3Schema.properties[spec].properties[template].properties[spec].properties[initContainers].items.properties[ports].items.properties[protocol].default: Required value: this property is in x-kubernetes-list-map-keys, so it must have a default or be a required property]
 #
-# Note that controller-gen newer than 0.6.2 is needed due to https://github.com/kubernetes-sigs/controller-tools/issues/448
+# Note that controller-gen newer than 0.8.1 is needed due to https://github.com/kubernetes-sigs/controller-tools/issues/448
 # Otherwise ObjectMeta embedded in Spec results in empty on the storage.
-controller-gen:
-ifeq (, $(shell which controller-gen))
-ifeq (, $(wildcard $(GOBIN)/controller-gen))
-	@{ \
-	set -e ;\
-	CONTROLLER_GEN_TMP_DIR=$$(mktemp -d) ;\
-	cd $$CONTROLLER_GEN_TMP_DIR ;\
-	go mod init tmp ;\
-	go install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.17.2 ;\
-	rm -rf $$CONTROLLER_GEN_TMP_DIR ;\
-	}
-endif
-CONTROLLER_GEN=$(GOBIN)/controller-gen
-else
-CONTROLLER_GEN=$(shell which controller-gen)
-endif
-
-# find or download yq
-# download yq if necessary
-# Use always go-version to get consistent line wraps etc.
-yq:
-ifeq (, $(wildcard $(GOBIN)/yq))
-	echo "Downloading yq"
-	@{ \
-	set -e ;\
-	YQ_TMP_DIR=$$(mktemp -d) ;\
-	cd $$YQ_TMP_DIR ;\
-	go mod init tmp ;\
-	go install github.com/mikefarah/yq/v4@v4.25.3 ;\
-	rm -rf $$YQ_TMP_DIR ;\
-	}
-endif
-YQ=$(GOBIN)/yq
 
 # find or download shellcheck
 # download shellcheck if necessary
@@ -365,68 +334,10 @@ ifeq (, $(wildcard $(TOOLS_PATH)/shellcheck))
 endif
 SHELLCHECK=$(TOOLS_PATH)/shellcheck
 
-# find or download etcd
-etcd:
-ifeq (, $(shell which etcd))
-ifeq (, $(wildcard $(TEST_ASSETS)/etcd))
-	@{ \
-	set -xe ;\
-	INSTALL_TMP_DIR=$$(mktemp -d) ;\
-	cd $$INSTALL_TMP_DIR ;\
-	wget https://github.com/coreos/etcd/releases/download/v3.4.22/etcd-v3.4.22-$(OS_NAME)-amd64.$(ETCD_EXTENSION);\
-	mkdir -p $(TEST_ASSETS) ;\
-	$(EXTRACT_COMMAND) etcd-v3.4.22-$(OS_NAME)-amd64.$(ETCD_EXTENSION) ;\
-	mv etcd-v3.4.22-$(OS_NAME)-amd64/etcd $(TEST_ASSETS)/etcd ;\
-	rm -rf $$INSTALL_TMP_DIR ;\
+.PHONY: setup-envtest
+setup-envtest:
+	@echo "Setting up envtest binaries for Kubernetes version $(ENVTEST_K8S_VERSION)..."
+	@$(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(GOBIN) -p path || { \
+		echo "Error: Failed to set up envtest binaries for version $(ENVTEST_K8S_VERSION)."; \
+		exit 1; \
 	}
-ETCD_BIN=$(TEST_ASSETS)/etcd
-else
-ETCD_BIN=$(TEST_ASSETS)/etcd
-endif
-else
-ETCD_BIN=$(shell which etcd)
-endif
-
-# find or download kube-apiserver
-kube-apiserver:
-ifeq (, $(shell which kube-apiserver))
-ifeq (, $(wildcard $(TEST_ASSETS)/kube-apiserver))
-	@{ \
-	set -xe ;\
-	INSTALL_TMP_DIR=$$(mktemp -d) ;\
-	cd $$INSTALL_TMP_DIR ;\
-	wget https://github.com/kubernetes-sigs/kubebuilder/releases/download/v2.3.2/kubebuilder_2.3.2_$(OS_NAME)_amd64.tar.gz ;\
-	mkdir -p $(TEST_ASSETS) ;\
-	tar zxvf kubebuilder_2.3.2_$(OS_NAME)_amd64.tar.gz ;\
-	mv kubebuilder_2.3.2_$(OS_NAME)_amd64/bin/kube-apiserver $(TEST_ASSETS)/kube-apiserver ;\
-	rm -rf $$INSTALL_TMP_DIR ;\
-	}
-KUBE_APISERVER_BIN=$(TEST_ASSETS)/kube-apiserver
-else
-KUBE_APISERVER_BIN=$(TEST_ASSETS)/kube-apiserver
-endif
-else
-KUBE_APISERVER_BIN=$(shell which kube-apiserver)
-endif
-
-# find or download kubectl
-kubectl:
-ifeq (, $(shell which kubectl))
-ifeq (, $(wildcard $(TEST_ASSETS)/kubectl))
-	@{ \
-	set -xe ;\
-	INSTALL_TMP_DIR=$$(mktemp -d) ;\
-	cd $$INSTALL_TMP_DIR ;\
-	wget https://github.com/kubernetes-sigs/kubebuilder/releases/download/v2.3.2/kubebuilder_2.3.2_$(OS_NAME)_amd64.tar.gz ;\
-	mkdir -p $(TEST_ASSETS) ;\
-	tar zxvf kubebuilder_2.3.2_$(OS_NAME)_amd64.tar.gz ;\
-	mv kubebuilder_2.3.2_$(OS_NAME)_amd64/bin/kubectl $(TEST_ASSETS)/kubectl ;\
-	rm -rf $$INSTALL_TMP_DIR ;\
-	}
-KUBECTL_BIN=$(TEST_ASSETS)/kubectl
-else
-KUBECTL_BIN=$(TEST_ASSETS)/kubectl
-endif
-else
-KUBECTL_BIN=$(shell which kubectl)
-endif

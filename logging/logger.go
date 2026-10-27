@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"time"
 
@@ -22,21 +23,18 @@ const (
 	LogFormatJSON = "json"
 )
 
-var (
-	LogOpts = zap.Options{
-		TimeEncoder: zapcore.TimeEncoderOfLayout(time.RFC3339),
-		Development: true,
-		EncoderConfigOptions: []zap.EncoderConfigOption{
-			func(ec *zapcore.EncoderConfig) {
-				ec.LevelKey = "severity"
-				ec.MessageKey = "message"
-			},
+var LogOpts = zap.Options{
+	TimeEncoder: zapcore.TimeEncoderOfLayout(time.RFC3339),
+	Development: true,
+	EncoderConfigOptions: []zap.EncoderConfigOption{
+		func(ec *zapcore.EncoderConfig) {
+			ec.LevelKey = "severity"
+			ec.MessageKey = "message"
 		},
-	}
-)
+	},
+}
 
 func NewLogger(logLevel string, logFormat string) (logr.Logger, error) {
-
 	if !validLogFormat(logFormat) {
 		return logr.Logger{}, errors.New("invalid log format specified")
 	}
@@ -81,10 +79,5 @@ func NewLogger(logLevel string, logFormat string) (logr.Logger, error) {
 
 func validLogFormat(logFormat string) bool {
 	validFormat := []string{"text", "json"}
-	for _, v := range validFormat {
-		if v == logFormat {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(validFormat, logFormat)
 }

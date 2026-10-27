@@ -1,5 +1,5 @@
 # Build the manager binary
-FROM --platform=$BUILDPLATFORM golang:1.24.0 as builder
+FROM --platform=$BUILDPLATFORM golang:1.27.3 AS builder
 
 WORKDIR /workspace
 
@@ -30,17 +30,17 @@ ARG TARGETPLATFORM TARGETOS TARGETARCH TARGETVARIANT VERSION=dev COMMIT_SHA=dev
 # to avoid https://github.com/moby/buildkit/issues/2334
 # We can use docker layer cache so the build is fast enogh anyway
 # We also use per-platform GOCACHE for the same reason.
-ENV GOCACHE /build/${TARGETPLATFORM}/root/.cache/go-build
+ENV GOCACHE="/build/${TARGETPLATFORM}/root/.cache/go-build"
 
 # Build
 RUN --mount=target=. \
-  --mount=type=cache,mode=0777,target=${GOCACHE} \
-  export GOOS=${TARGETOS} GOARCH=${TARGETARCH} GOARM=${TARGETVARIANT#v} && \
-  go build -trimpath -ldflags="-s -w -X 'github.com/actions/actions-runner-controller/build.Version=${VERSION}' -X 'github.com/actions/actions-runner-controller/build.CommitSHA=${COMMIT_SHA}'" -o /out/manager main.go && \
-  go build -trimpath -ldflags="-s -w -X 'github.com/actions/actions-runner-controller/build.Version=${VERSION}' -X 'github.com/actions/actions-runner-controller/build.CommitSHA=${COMMIT_SHA}'" -o /out/ghalistener ./cmd/ghalistener && \
-  go build -trimpath -ldflags="-s -w" -o /out/github-webhook-server ./cmd/githubwebhookserver && \
-  go build -trimpath -ldflags="-s -w" -o /out/actions-metrics-server ./cmd/actionsmetricsserver && \
-  go build -trimpath -ldflags="-s -w" -o /out/sleep ./cmd/sleep
+    --mount=type=cache,mode=0777,target=${GOCACHE} \
+    export GOOS=${TARGETOS} GOARCH=${TARGETARCH} GOARM=${TARGETVARIANT#v} && \
+    go build -trimpath -ldflags="-s -w -X 'github.com/actions/actions-runner-controller/build.Version=${VERSION}' -X 'github.com/actions/actions-runner-controller/build.CommitSHA=${COMMIT_SHA}'" -o /out/manager main.go && \
+    go build -trimpath -ldflags="-s -w -X 'github.com/actions/actions-runner-controller/build.Version=${VERSION}' -X 'github.com/actions/actions-runner-controller/build.CommitSHA=${COMMIT_SHA}'" -o /out/ghalistener ./cmd/ghalistener && \
+    go build -trimpath -ldflags="-s -w" -o /out/github-webhook-server ./cmd/githubwebhookserver && \
+    go build -trimpath -ldflags="-s -w" -o /out/actions-metrics-server ./cmd/actionsmetricsserver && \
+    go build -trimpath -ldflags="-s -w" -o /out/sleep ./cmd/sleep
 
 # Use distroless as minimal base image to package the manager binary
 # Refer to https://github.com/GoogleContainerTools/distroless for more details
