@@ -2,6 +2,7 @@ package tests
 
 import (
 	"fmt"
+	"maps"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -18,6 +19,7 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/utils/ptr"
 )
 
 func TestTemplateRenderedGitHubSecretWithGitHubToken(t *testing.T) {
@@ -28,7 +30,7 @@ func TestTemplateRenderedGitHubSecretWithGitHubToken(t *testing.T) {
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger: logger.Discard,
@@ -41,7 +43,7 @@ func TestTemplateRenderedGitHubSecretWithGitHubToken(t *testing.T) {
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	output := helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/githubsecret.yaml"})
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/githubsecret.yaml"})
 
 	var githubSecret corev1.Secret
 	helm.UnmarshalK8SYaml(t, output, &githubSecret)
@@ -60,7 +62,7 @@ func TestTemplateRenderedGitHubSecretWithGitHubApp(t *testing.T) {
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger: logger.Discard,
@@ -75,7 +77,7 @@ func TestTemplateRenderedGitHubSecretWithGitHubApp(t *testing.T) {
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	output := helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/githubsecret.yaml"})
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/githubsecret.yaml"})
 
 	var githubSecret corev1.Secret
 	helm.UnmarshalK8SYaml(t, output, &githubSecret)
@@ -94,7 +96,7 @@ func TestTemplateRenderedGitHubSecretErrorWithMissingAuthInput(t *testing.T) {
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger: logger.Discard,
@@ -108,7 +110,7 @@ func TestTemplateRenderedGitHubSecretErrorWithMissingAuthInput(t *testing.T) {
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	_, err = helm.RenderTemplateE(t, options, helmChartPath, releaseName, []string{"templates/githubsecret.yaml"})
+	_, err = helm.RenderTemplateContextE(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/githubsecret.yaml"})
 	require.Error(t, err)
 
 	assert.ErrorContains(t, err, "provide .Values.githubConfigSecret.github_token or .Values.githubConfigSecret.github_app_id")
@@ -122,7 +124,7 @@ func TestTemplateRenderedGitHubSecretErrorWithMissingAppInput(t *testing.T) {
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger: logger.Discard,
@@ -135,10 +137,166 @@ func TestTemplateRenderedGitHubSecretErrorWithMissingAppInput(t *testing.T) {
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	_, err = helm.RenderTemplateE(t, options, helmChartPath, releaseName, []string{"templates/githubsecret.yaml"})
+	_, err = helm.RenderTemplateContextE(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/githubsecret.yaml"})
 	require.Error(t, err)
 
 	assert.ErrorContains(t, err, "provide .Values.githubConfigSecret.github_app_installation_id and .Values.githubConfigSecret.github_app_private_key")
+}
+
+func TestTemplateListenerScalerValidation(t *testing.T) {
+	t.Parallel()
+
+	helmChartPath, err := filepath.Abs("../../gha-runner-scale-set")
+	require.NoError(t, err)
+
+	baseValues := map[string]string{
+		"githubConfigUrl":                    "https://github.com/actions",
+		"githubConfigSecret.github_token":    "gh_token12345",
+		"controllerServiceAccount.name":      "arc",
+		"controllerServiceAccount.namespace": "arc-system",
+	}
+	tests := []struct {
+		name          string
+		setValues     map[string]string
+		setStrValues  map[string]string
+		wantErrorText string
+	}{
+		{
+			name:          "zero qps",
+			setValues:     map[string]string{"listenerConfig.scaler.qps": "0"},
+			wantErrorText: "at '/listenerConfig/scaler/qps': minimum: got 0, want 1",
+		},
+		{
+			name:          "negative burst",
+			setValues:     map[string]string{"listenerConfig.scaler.burst": "-1"},
+			wantErrorText: "at '/listenerConfig/scaler/burst': minimum: got -1, want 1",
+		},
+		{
+			name:          "fractional qps",
+			setValues:     map[string]string{"listenerConfig.scaler.qps": "1.5"},
+			wantErrorText: "at '/listenerConfig/scaler/qps'",
+		},
+		{
+			name:          "string burst",
+			setStrValues:  map[string]string{"listenerConfig.scaler.burst": "100"},
+			wantErrorText: "at '/listenerConfig/scaler/burst': got string, want integer",
+		},
+		{
+			name:          "boolean qps",
+			setValues:     map[string]string{"listenerConfig.scaler.qps": "true"},
+			wantErrorText: "at '/listenerConfig/scaler/qps': got boolean, want integer",
+		},
+		{
+			name:          "scaler is not an object",
+			setValues:     map[string]string{"listenerConfig.scaler[0]": "a"},
+			wantErrorText: "at '/listenerConfig/scaler': got array, want null or object",
+		},
+		{
+			name:          "listenerConfig is not an object",
+			setStrValues:  map[string]string{"listenerConfig": "foo"},
+			wantErrorText: "at '/listenerConfig': got string, want null or object",
+		},
+		{
+			name:          "misspelled scaler key",
+			setValues:     map[string]string{"listenerConfig.scalar.qps": "5"},
+			wantErrorText: "at '/listenerConfig': additional properties 'scalar' not allowed",
+		},
+		{
+			name:          "unknown key under scaler",
+			setStrValues:  map[string]string{"listenerConfig.scaler.foo": "bar"},
+			wantErrorText: "at '/listenerConfig/scaler': additional properties 'foo' not allowed",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setValues := make(map[string]string, len(baseValues)+len(tt.setValues))
+			maps.Copy(setValues, baseValues)
+			maps.Copy(setValues, tt.setValues)
+
+			options := &helm.Options{
+				Logger:         logger.Discard,
+				SetValues:      setValues,
+				SetStrValues:   tt.setStrValues,
+				KubectlOptions: k8s.NewKubectlOptions("", "", "test"),
+			}
+			_, err := helm.RenderTemplateContextE(t, t.Context(), options, helmChartPath, "test-runners", []string{"templates/autoscalingrunnerset.yaml"})
+			require.Error(t, err)
+			assert.ErrorContains(t, err, tt.wantErrorText)
+		})
+	}
+}
+
+func TestTemplateListenerScalerConfig(t *testing.T) {
+	t.Parallel()
+
+	helmChartPath, err := filepath.Abs("../../gha-runner-scale-set")
+	require.NoError(t, err)
+
+	baseValues := map[string]string{
+		"githubConfigUrl":                    "https://github.com/actions",
+		"githubConfigSecret.github_token":    "gh_token12345",
+		"controllerServiceAccount.name":      "arc",
+		"controllerServiceAccount.namespace": "arc-system",
+	}
+	tests := []struct {
+		name      string
+		setValues map[string]string
+		wantQPS   *int
+		wantBurst *int
+	}{
+		{
+			name:      "defaults from values.yaml",
+			wantQPS:   ptr.To(50),
+			wantBurst: ptr.To(100),
+		},
+		{
+			name:      "both overridden",
+			setValues: map[string]string{"listenerConfig.scaler.qps": "100", "listenerConfig.scaler.burst": "200"},
+			wantQPS:   ptr.To(100),
+			wantBurst: ptr.To(200),
+		},
+		{
+			name:      "qps overridden keeps default burst",
+			setValues: map[string]string{"listenerConfig.scaler.qps": "75"},
+			wantQPS:   ptr.To(75),
+			wantBurst: ptr.To(100),
+		},
+		{
+			name:      "listenerConfig disabled",
+			setValues: map[string]string{"listenerConfig": "null"},
+			wantQPS:   nil,
+			wantBurst: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setValues := make(map[string]string, len(baseValues)+len(tt.setValues))
+			maps.Copy(setValues, baseValues)
+			maps.Copy(setValues, tt.setValues)
+
+			options := &helm.Options{
+				Logger:         logger.Discard,
+				SetValues:      setValues,
+				KubectlOptions: k8s.NewKubectlOptions("", "", "test"),
+			}
+			output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, "test-runners", []string{"templates/autoscalingrunnerset.yaml"})
+
+			var ars v1alpha1.AutoscalingRunnerSet
+			helm.UnmarshalK8SYaml(t, output, &ars)
+
+			if tt.wantQPS == nil && tt.wantBurst == nil {
+				assert.Nil(t, ars.Spec.ListenerConfig.GetScaler())
+				return
+			}
+
+			scaler := ars.Spec.ListenerConfig.GetScaler()
+			require.NotNil(t, scaler)
+			assert.Equal(t, tt.wantQPS, scaler.QPS)
+			assert.Equal(t, tt.wantBurst, scaler.Burst)
+		})
+	}
 }
 
 func TestTemplateNotRenderedGitHubSecretWithPredefinedSecret(t *testing.T) {
@@ -149,7 +307,7 @@ func TestTemplateNotRenderedGitHubSecretWithPredefinedSecret(t *testing.T) {
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger: logger.Discard,
@@ -162,7 +320,7 @@ func TestTemplateNotRenderedGitHubSecretWithPredefinedSecret(t *testing.T) {
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	_, err = helm.RenderTemplateE(t, options, helmChartPath, releaseName, []string{"templates/githubsecret.yaml"})
+	_, err = helm.RenderTemplateContextE(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/githubsecret.yaml"})
 	assert.ErrorContains(t, err, "could not find template templates/githubsecret.yaml in chart", "secret should not be rendered since a pre-defined secret is provided")
 }
 
@@ -174,7 +332,7 @@ func TestTemplateRenderedSetServiceAccountToNoPermission(t *testing.T) {
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger: logger.Discard,
@@ -187,14 +345,14 @@ func TestTemplateRenderedSetServiceAccountToNoPermission(t *testing.T) {
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	output := helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/no_permission_serviceaccount.yaml"})
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/no_permission_serviceaccount.yaml"})
 	var serviceAccount corev1.ServiceAccount
 	helm.UnmarshalK8SYaml(t, output, &serviceAccount)
 
 	assert.Equal(t, namespaceName, serviceAccount.Namespace)
 	assert.Equal(t, "test-runners-gha-rs-no-permission", serviceAccount.Name)
 
-	output = helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+	output = helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
 	var ars v1alpha1.AutoscalingRunnerSet
 	helm.UnmarshalK8SYaml(t, output, &ars)
 
@@ -204,13 +362,12 @@ func TestTemplateRenderedSetServiceAccountToNoPermission(t *testing.T) {
 
 func TestTemplateRenderedSetServiceAccountToKubeMode(t *testing.T) {
 	t.Parallel()
-
 	// Path to the helm chart we will test
 	helmChartPath, err := filepath.Abs("../../gha-runner-scale-set")
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger: logger.Discard,
@@ -224,7 +381,7 @@ func TestTemplateRenderedSetServiceAccountToKubeMode(t *testing.T) {
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	output := helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/kube_mode_serviceaccount.yaml"})
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/kube_mode_serviceaccount.yaml"})
 	var serviceAccount corev1.ServiceAccount
 	helm.UnmarshalK8SYaml(t, output, &serviceAccount)
 
@@ -232,7 +389,7 @@ func TestTemplateRenderedSetServiceAccountToKubeMode(t *testing.T) {
 	assert.Equal(t, "test-runners-gha-rs-kube-mode", serviceAccount.Name)
 	assert.Equal(t, "actions.github.com/cleanup-protection", serviceAccount.Finalizers[0])
 
-	output = helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/kube_mode_role.yaml"})
+	output = helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/kube_mode_role.yaml"})
 	var role rbacv1.Role
 	helm.UnmarshalK8SYaml(t, output, &role)
 
@@ -248,7 +405,7 @@ func TestTemplateRenderedSetServiceAccountToKubeMode(t *testing.T) {
 	assert.Equal(t, "jobs", role.Rules[3].Resources[0])
 	assert.Equal(t, "secrets", role.Rules[4].Resources[0])
 
-	output = helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/kube_mode_role_binding.yaml"})
+	output = helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/kube_mode_role_binding.yaml"})
 	var roleBinding rbacv1.RoleBinding
 	helm.UnmarshalK8SYaml(t, output, &roleBinding)
 
@@ -261,13 +418,120 @@ func TestTemplateRenderedSetServiceAccountToKubeMode(t *testing.T) {
 	assert.Equal(t, "Role", roleBinding.RoleRef.Kind)
 	assert.Equal(t, "actions.github.com/cleanup-protection", serviceAccount.Finalizers[0])
 
-	output = helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+	output = helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
 	var ars v1alpha1.AutoscalingRunnerSet
 	helm.UnmarshalK8SYaml(t, output, &ars)
 
 	expectedServiceAccountName := "test-runners-gha-rs-kube-mode"
 	assert.Equal(t, expectedServiceAccountName, ars.Spec.Template.Spec.ServiceAccountName)
 	assert.Equal(t, expectedServiceAccountName, ars.Annotations[actionsgithubcom.AnnotationKeyKubernetesModeServiceAccountName])
+}
+
+func TestTemplateRenderedSetServiceAccountToKubeNoVolumeMode(t *testing.T) {
+	t.Parallel()
+	// Path to the helm chart we will test
+	helmChartPath, err := filepath.Abs("../../gha-runner-scale-set")
+	require.NoError(t, err)
+
+	releaseName := "test-runners"
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
+
+	options := &helm.Options{
+		Logger: logger.Discard,
+		SetValues: map[string]string{
+			"githubConfigUrl":                    "https://github.com/actions",
+			"githubConfigSecret.github_token":    "gh_token12345",
+			"containerMode.type":                 "kubernetes-novolume",
+			"controllerServiceAccount.name":      "arc",
+			"controllerServiceAccount.namespace": "arc-system",
+		},
+		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
+	}
+
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/kube_mode_serviceaccount.yaml"})
+	var serviceAccount corev1.ServiceAccount
+	helm.UnmarshalK8SYaml(t, output, &serviceAccount)
+
+	assert.Equal(t, namespaceName, serviceAccount.Namespace)
+	assert.Equal(t, "test-runners-gha-rs-kube-mode", serviceAccount.Name)
+	assert.Equal(t, "actions.github.com/cleanup-protection", serviceAccount.Finalizers[0])
+
+	output = helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/kube_mode_role.yaml"})
+	var role rbacv1.Role
+	helm.UnmarshalK8SYaml(t, output, &role)
+
+	assert.Equal(t, namespaceName, role.Namespace)
+	assert.Equal(t, "test-runners-gha-rs-kube-mode", role.Name)
+
+	assert.Equal(t, "actions.github.com/cleanup-protection", role.Finalizers[0])
+
+	assert.Len(t, role.Rules, 4, "kube mode role should have 4 rules")
+	assert.Equal(t, "pods", role.Rules[0].Resources[0])
+	assert.Equal(t, "pods/exec", role.Rules[1].Resources[0])
+	assert.Equal(t, "pods/log", role.Rules[2].Resources[0])
+	assert.Equal(t, "secrets", role.Rules[3].Resources[0])
+
+	output = helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/kube_mode_role_binding.yaml"})
+	var roleBinding rbacv1.RoleBinding
+	helm.UnmarshalK8SYaml(t, output, &roleBinding)
+
+	assert.Equal(t, namespaceName, roleBinding.Namespace)
+	assert.Equal(t, "test-runners-gha-rs-kube-mode", roleBinding.Name)
+	assert.Len(t, roleBinding.Subjects, 1)
+	assert.Equal(t, "test-runners-gha-rs-kube-mode", roleBinding.Subjects[0].Name)
+	assert.Equal(t, namespaceName, roleBinding.Subjects[0].Namespace)
+	assert.Equal(t, "test-runners-gha-rs-kube-mode", roleBinding.RoleRef.Name)
+	assert.Equal(t, "Role", roleBinding.RoleRef.Kind)
+	assert.Equal(t, "actions.github.com/cleanup-protection", serviceAccount.Finalizers[0])
+
+	output = helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+	var ars v1alpha1.AutoscalingRunnerSet
+	helm.UnmarshalK8SYaml(t, output, &ars)
+
+	expectedServiceAccountName := "test-runners-gha-rs-kube-mode"
+	assert.Equal(t, expectedServiceAccountName, ars.Spec.Template.Spec.ServiceAccountName)
+	assert.Equal(t, expectedServiceAccountName, ars.Annotations[actionsgithubcom.AnnotationKeyKubernetesModeServiceAccountName])
+}
+
+func TestTemplateRenderedNoPermissionServiceAccountNotRenderedInKubernetesModes(t *testing.T) {
+	t.Parallel()
+
+	for _, mode := range []string{"kubernetes", "kubernetes-novolume"} {
+		t.Run("containerMode "+mode, func(t *testing.T) {
+			helmChartPath, err := filepath.Abs("../../gha-runner-scale-set")
+			require.NoError(t, err)
+
+			releaseName := "test-runners"
+			namespaceName := "test-" + strings.ToLower(random.UniqueID())
+
+			options := &helm.Options{
+				Logger: logger.Discard,
+				SetValues: map[string]string{
+					"githubConfigUrl":                    "https://github.com/actions",
+					"githubConfigSecret.github_token":    "gh_token12345",
+					"controllerServiceAccount.name":      "arc",
+					"controllerServiceAccount.namespace": "arc-system",
+					"containerMode.type":                 mode,
+				},
+				KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
+			}
+
+			_, err = helm.RenderTemplateContextE(
+				t,
+				t.Context(),
+				options,
+				helmChartPath,
+				releaseName,
+				[]string{"templates/no_permission_serviceaccount.yaml"},
+			)
+			assert.ErrorContains(
+				t,
+				err,
+				"could not find template templates/no_permission_serviceaccount.yaml in chart",
+				"no permission service account should not be rendered in "+mode+" mode",
+			)
+		})
+	}
 }
 
 func TestTemplateRenderedUserProvideSetServiceAccount(t *testing.T) {
@@ -278,7 +542,7 @@ func TestTemplateRenderedUserProvideSetServiceAccount(t *testing.T) {
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger: logger.Discard,
@@ -292,10 +556,10 @@ func TestTemplateRenderedUserProvideSetServiceAccount(t *testing.T) {
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	_, err = helm.RenderTemplateE(t, options, helmChartPath, releaseName, []string{"templates/no_permission_serviceaccount.yaml"})
+	_, err = helm.RenderTemplateContextE(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/no_permission_serviceaccount.yaml"})
 	assert.ErrorContains(t, err, "could not find template templates/no_permission_serviceaccount.yaml in chart", "no permission service account should not be rendered")
 
-	output := helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
 	var ars v1alpha1.AutoscalingRunnerSet
 	helm.UnmarshalK8SYaml(t, output, &ars)
 
@@ -311,7 +575,7 @@ func TestTemplateRenderedAutoScalingRunnerSet(t *testing.T) {
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger: logger.Discard,
@@ -324,7 +588,7 @@ func TestTemplateRenderedAutoScalingRunnerSet(t *testing.T) {
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	output := helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
 
 	var ars v1alpha1.AutoscalingRunnerSet
 	helm.UnmarshalK8SYaml(t, output, &ars)
@@ -364,7 +628,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_RunnerScaleSetName(t *testing.T) {
 
 	releaseName := "test-runners"
 	nameOverride := "test-runner-scale-set-name"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger: logger.Discard,
@@ -378,7 +642,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_RunnerScaleSetName(t *testing.T) {
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	output := helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
 
 	var ars v1alpha1.AutoscalingRunnerSet
 	helm.UnmarshalK8SYaml(t, output, &ars)
@@ -409,6 +673,37 @@ func TestTemplateRenderedAutoScalingRunnerSet_RunnerScaleSetName(t *testing.T) {
 	assert.Equal(t, "ghcr.io/actions/actions-runner:latest", ars.Spec.Template.Spec.Containers[0].Image)
 }
 
+func TestTemplateRenderedAutoScalingRunnerSet_ScaleSetLabels(t *testing.T) {
+	t.Parallel()
+
+	// Path to the helm chart we will test
+	helmChartPath, err := filepath.Abs("../../gha-runner-scale-set")
+	require.NoError(t, err)
+
+	releaseName := "test-runners"
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
+
+	options := &helm.Options{
+		Logger: logger.Discard,
+		SetValues: map[string]string{
+			"githubConfigUrl":                    "https://github.com/actions",
+			"githubConfigSecret.github_token":    "gh_token12345",
+			"scaleSetLabels[0]":                  "linux",
+			"scaleSetLabels[1]":                  "x64",
+			"controllerServiceAccount.name":      "arc",
+			"controllerServiceAccount.namespace": "arc-system",
+		},
+		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
+	}
+
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+
+	var ars v1alpha1.AutoscalingRunnerSet
+	helm.UnmarshalK8SYaml(t, output, &ars)
+
+	assert.Equal(t, []string{"linux", "x64"}, ars.Spec.RunnerScaleSetLabels)
+}
+
 func TestTemplateRenderedAutoScalingRunnerSet_ProvideMetadata(t *testing.T) {
 	t.Parallel()
 
@@ -417,7 +712,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_ProvideMetadata(t *testing.T) {
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger: logger.Discard,
@@ -434,7 +729,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_ProvideMetadata(t *testing.T) {
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	output := helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
 
 	var ars v1alpha1.AutoscalingRunnerSet
 	helm.UnmarshalK8SYaml(t, output, &ars)
@@ -465,7 +760,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_MaxRunnersValidationError(t *testi
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger: logger.Discard,
@@ -479,7 +774,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_MaxRunnersValidationError(t *testi
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	_, err = helm.RenderTemplateE(t, options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+	_, err = helm.RenderTemplateContextE(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
 	require.Error(t, err)
 
 	assert.ErrorContains(t, err, "maxRunners has to be greater or equal to 0")
@@ -493,7 +788,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_MinRunnersValidationError(t *testi
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger: logger.Discard,
@@ -508,7 +803,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_MinRunnersValidationError(t *testi
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	_, err = helm.RenderTemplateE(t, options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+	_, err = helm.RenderTemplateContextE(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
 	require.Error(t, err)
 
 	assert.ErrorContains(t, err, "minRunners has to be greater or equal to 0")
@@ -522,7 +817,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_MinMaxRunnersValidationError(t *te
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger: logger.Discard,
@@ -537,7 +832,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_MinMaxRunnersValidationError(t *te
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	_, err = helm.RenderTemplateE(t, options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+	_, err = helm.RenderTemplateContextE(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
 	require.Error(t, err)
 
 	assert.ErrorContains(t, err, "maxRunners has to be greater or equal to minRunners")
@@ -551,7 +846,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_MinMaxRunnersValidationSameValue(t
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger: logger.Discard,
@@ -566,7 +861,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_MinMaxRunnersValidationSameValue(t
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	output := helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
 
 	var ars v1alpha1.AutoscalingRunnerSet
 	helm.UnmarshalK8SYaml(t, output, &ars)
@@ -583,7 +878,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_MinMaxRunnersValidation_OnlyMin(t 
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger: logger.Discard,
@@ -597,7 +892,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_MinMaxRunnersValidation_OnlyMin(t 
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	output := helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
 
 	var ars v1alpha1.AutoscalingRunnerSet
 	helm.UnmarshalK8SYaml(t, output, &ars)
@@ -614,7 +909,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_MinMaxRunnersValidation_OnlyMax(t 
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger: logger.Discard,
@@ -628,7 +923,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_MinMaxRunnersValidation_OnlyMax(t 
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	output := helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
 
 	var ars v1alpha1.AutoscalingRunnerSet
 	helm.UnmarshalK8SYaml(t, output, &ars)
@@ -648,7 +943,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_MinMaxRunners_FromValuesFile(t *te
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger:         logger.Discard,
@@ -656,7 +951,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_MinMaxRunners_FromValuesFile(t *te
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	output := helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
 
 	var ars v1alpha1.AutoscalingRunnerSet
 	helm.UnmarshalK8SYaml(t, output, &ars)
@@ -676,7 +971,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_ExtraVolumes(t *testing.T) {
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger: logger.Discard,
@@ -688,7 +983,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_ExtraVolumes(t *testing.T) {
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	output := helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
 
 	var ars v1alpha1.AutoscalingRunnerSet
 	helm.UnmarshalK8SYaml(t, output, &ars)
@@ -711,7 +1006,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_DinD_ExtraInitContainers(t *testin
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger: logger.Discard,
@@ -723,25 +1018,25 @@ func TestTemplateRenderedAutoScalingRunnerSet_DinD_ExtraInitContainers(t *testin
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	output := helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
 
 	var ars v1alpha1.AutoscalingRunnerSet
 	helm.UnmarshalK8SYaml(t, output, &ars)
 
-	assert.Len(t, ars.Spec.Template.Spec.InitContainers, 3, "InitContainers should be 3")
-	assert.Equal(t, "kube-init", ars.Spec.Template.Spec.InitContainers[1].Name, "InitContainers[1] Name should be kube-init")
-	assert.Equal(t, "runner-image:latest", ars.Spec.Template.Spec.InitContainers[1].Image, "InitContainers[1] Image should be runner-image:latest")
-	assert.Equal(t, "sudo", ars.Spec.Template.Spec.InitContainers[1].Command[0], "InitContainers[1] Command[0] should be sudo")
-	assert.Equal(t, "chown", ars.Spec.Template.Spec.InitContainers[1].Command[1], "InitContainers[1] Command[1] should be chown")
-	assert.Equal(t, "-R", ars.Spec.Template.Spec.InitContainers[1].Command[2], "InitContainers[1] Command[2] should be -R")
-	assert.Equal(t, "1001:123", ars.Spec.Template.Spec.InitContainers[1].Command[3], "InitContainers[1] Command[3] should be 1001:123")
-	assert.Equal(t, "/home/runner/_work", ars.Spec.Template.Spec.InitContainers[1].Command[4], "InitContainers[1] Command[4] should be /home/runner/_work")
-	assert.Equal(t, "work", ars.Spec.Template.Spec.InitContainers[1].VolumeMounts[0].Name, "InitContainers[1] VolumeMounts[0] Name should be work")
-	assert.Equal(t, "/home/runner/_work", ars.Spec.Template.Spec.InitContainers[1].VolumeMounts[0].MountPath, "InitContainers[1] VolumeMounts[0] MountPath should be /home/runner/_work")
+	assert.Len(t, ars.Spec.Template.Spec.InitContainers, 4, "InitContainers should be 4")
+	assert.Equal(t, "kube-init", ars.Spec.Template.Spec.InitContainers[2].Name, "InitContainers[1] Name should be kube-init")
+	assert.Equal(t, "runner-image:latest", ars.Spec.Template.Spec.InitContainers[2].Image, "InitContainers[1] Image should be runner-image:latest")
+	assert.Equal(t, "sudo", ars.Spec.Template.Spec.InitContainers[2].Command[0], "InitContainers[1] Command[0] should be sudo")
+	assert.Equal(t, "chown", ars.Spec.Template.Spec.InitContainers[2].Command[1], "InitContainers[1] Command[1] should be chown")
+	assert.Equal(t, "-R", ars.Spec.Template.Spec.InitContainers[2].Command[2], "InitContainers[1] Command[2] should be -R")
+	assert.Equal(t, "1001:123", ars.Spec.Template.Spec.InitContainers[2].Command[3], "InitContainers[1] Command[3] should be 1001:123")
+	assert.Equal(t, "/home/runner/_work", ars.Spec.Template.Spec.InitContainers[2].Command[4], "InitContainers[1] Command[4] should be /home/runner/_work")
+	assert.Equal(t, "work", ars.Spec.Template.Spec.InitContainers[2].VolumeMounts[0].Name, "InitContainers[1] VolumeMounts[0] Name should be work")
+	assert.Equal(t, "/home/runner/_work", ars.Spec.Template.Spec.InitContainers[2].VolumeMounts[0].MountPath, "InitContainers[1] VolumeMounts[0] MountPath should be /home/runner/_work")
 
-	assert.Equal(t, "ls", ars.Spec.Template.Spec.InitContainers[2].Name, "InitContainers[2] Name should be ls")
-	assert.Equal(t, "ubuntu:latest", ars.Spec.Template.Spec.InitContainers[2].Image, "InitContainers[2] Image should be ubuntu:latest")
-	assert.Equal(t, "ls", ars.Spec.Template.Spec.InitContainers[2].Command[0], "InitContainers[2] Command[0] should be ls")
+	assert.Equal(t, "ls", ars.Spec.Template.Spec.InitContainers[3].Name, "InitContainers[2] Name should be ls")
+	assert.Equal(t, "ubuntu:latest", ars.Spec.Template.Spec.InitContainers[3].Image, "InitContainers[2] Image should be ubuntu:latest")
+	assert.Equal(t, "ls", ars.Spec.Template.Spec.InitContainers[3].Command[0], "InitContainers[2] Command[0] should be ls")
 }
 
 func TestTemplateRenderedAutoScalingRunnerSet_DinD_ExtraVolumes(t *testing.T) {
@@ -755,7 +1050,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_DinD_ExtraVolumes(t *testing.T) {
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger: logger.Discard,
@@ -767,7 +1062,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_DinD_ExtraVolumes(t *testing.T) {
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	output := helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
 
 	var ars v1alpha1.AutoscalingRunnerSet
 	helm.UnmarshalK8SYaml(t, output, &ars)
@@ -792,7 +1087,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_K8S_ExtraVolumes(t *testing.T) {
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger: logger.Discard,
@@ -804,7 +1099,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_K8S_ExtraVolumes(t *testing.T) {
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	output := helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
 
 	var ars v1alpha1.AutoscalingRunnerSet
 	helm.UnmarshalK8SYaml(t, output, &ars)
@@ -824,7 +1119,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_EnableDinD(t *testing.T) {
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger: logger.Discard,
@@ -838,7 +1133,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_EnableDinD(t *testing.T) {
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	output := helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
 
 	var ars v1alpha1.AutoscalingRunnerSet
 	helm.UnmarshalK8SYaml(t, output, &ars)
@@ -860,13 +1155,26 @@ func TestTemplateRenderedAutoScalingRunnerSet_EnableDinD(t *testing.T) {
 
 	assert.NotNil(t, ars.Spec.Template.Spec, "Template.Spec should not be nil")
 
-	assert.Len(t, ars.Spec.Template.Spec.InitContainers, 1, "Template.Spec should have 1 init container")
+	assert.Len(t, ars.Spec.Template.Spec.InitContainers, 2, "Template.Spec should have 2 init container")
 	assert.Equal(t, "init-dind-externals", ars.Spec.Template.Spec.InitContainers[0].Name)
 	assert.Equal(t, "ghcr.io/actions/actions-runner:latest", ars.Spec.Template.Spec.InitContainers[0].Image)
 	assert.Equal(t, "cp", ars.Spec.Template.Spec.InitContainers[0].Command[0])
 	assert.Equal(t, "-r /home/runner/externals/. /home/runner/tmpDir/", strings.Join(ars.Spec.Template.Spec.InitContainers[0].Args, " "))
 
-	assert.Len(t, ars.Spec.Template.Spec.Containers, 2, "Template.Spec should have 2 container")
+	assert.Equal(t, "dind", ars.Spec.Template.Spec.InitContainers[1].Name)
+	assert.Equal(t, "docker:dind", ars.Spec.Template.Spec.InitContainers[1].Image)
+	assert.True(t, *ars.Spec.Template.Spec.InitContainers[1].SecurityContext.Privileged)
+	assert.Len(t, ars.Spec.Template.Spec.InitContainers[1].VolumeMounts, 3, "The dind container should have 3 volume mounts, dind-sock, work and externals")
+	assert.Equal(t, "work", ars.Spec.Template.Spec.InitContainers[1].VolumeMounts[0].Name)
+	assert.Equal(t, "/home/runner/_work", ars.Spec.Template.Spec.InitContainers[1].VolumeMounts[0].MountPath)
+
+	assert.Equal(t, "dind-sock", ars.Spec.Template.Spec.InitContainers[1].VolumeMounts[1].Name)
+	assert.Equal(t, "/var/run", ars.Spec.Template.Spec.InitContainers[1].VolumeMounts[1].MountPath)
+
+	assert.Equal(t, "dind-externals", ars.Spec.Template.Spec.InitContainers[1].VolumeMounts[2].Name)
+	assert.Equal(t, "/home/runner/externals", ars.Spec.Template.Spec.InitContainers[1].VolumeMounts[2].MountPath)
+
+	assert.Len(t, ars.Spec.Template.Spec.Containers, 1, "Template.Spec should have 1 container")
 	assert.Equal(t, "runner", ars.Spec.Template.Spec.Containers[0].Name)
 	assert.Equal(t, "ghcr.io/actions/actions-runner:latest", ars.Spec.Template.Spec.Containers[0].Image)
 	assert.Len(t, ars.Spec.Template.Spec.Containers[0].Env, 2, "The runner container should have 2 env vars, DOCKER_HOST and RUNNER_WAIT_FOR_DOCKER_IN_SECONDS")
@@ -883,19 +1191,6 @@ func TestTemplateRenderedAutoScalingRunnerSet_EnableDinD(t *testing.T) {
 	assert.Equal(t, "dind-sock", ars.Spec.Template.Spec.Containers[0].VolumeMounts[1].Name)
 	assert.Equal(t, "/var/run", ars.Spec.Template.Spec.Containers[0].VolumeMounts[1].MountPath)
 
-	assert.Equal(t, "dind", ars.Spec.Template.Spec.Containers[1].Name)
-	assert.Equal(t, "docker:dind", ars.Spec.Template.Spec.Containers[1].Image)
-	assert.True(t, *ars.Spec.Template.Spec.Containers[1].SecurityContext.Privileged)
-	assert.Len(t, ars.Spec.Template.Spec.Containers[1].VolumeMounts, 3, "The dind container should have 3 volume mounts, dind-sock, work and externals")
-	assert.Equal(t, "work", ars.Spec.Template.Spec.Containers[1].VolumeMounts[0].Name)
-	assert.Equal(t, "/home/runner/_work", ars.Spec.Template.Spec.Containers[1].VolumeMounts[0].MountPath)
-
-	assert.Equal(t, "dind-sock", ars.Spec.Template.Spec.Containers[1].VolumeMounts[1].Name)
-	assert.Equal(t, "/var/run", ars.Spec.Template.Spec.Containers[1].VolumeMounts[1].MountPath)
-
-	assert.Equal(t, "dind-externals", ars.Spec.Template.Spec.Containers[1].VolumeMounts[2].Name)
-	assert.Equal(t, "/home/runner/externals", ars.Spec.Template.Spec.Containers[1].VolumeMounts[2].MountPath)
-
 	assert.Len(t, ars.Spec.Template.Spec.Volumes, 3, "Volumes should be 3")
 	assert.Equal(t, "dind-sock", ars.Spec.Template.Spec.Volumes[0].Name, "Volume name should be dind-sock")
 	assert.Equal(t, "dind-externals", ars.Spec.Template.Spec.Volumes[1].Name, "Volume name should be dind-externals")
@@ -911,7 +1206,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_EnableKubernetesMode(t *testing.T)
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger: logger.Discard,
@@ -925,7 +1220,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_EnableKubernetesMode(t *testing.T)
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	output := helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
 
 	var ars v1alpha1.AutoscalingRunnerSet
 	helm.UnmarshalK8SYaml(t, output, &ars)
@@ -961,6 +1256,134 @@ func TestTemplateRenderedAutoScalingRunnerSet_EnableKubernetesMode(t *testing.T)
 	assert.NotNil(t, ars.Spec.Template.Spec.Volumes[0].Ephemeral, "Template.Spec should have 1 ephemeral volume")
 }
 
+func TestTemplateRenderedAutoScalingRunnerSet_EnableKubernetesModeNoVolume(t *testing.T) {
+	t.Parallel()
+
+	// Path to the helm chart we will test
+	helmChartPath, err := filepath.Abs("../../gha-runner-scale-set")
+	require.NoError(t, err)
+
+	releaseName := "test-runners"
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
+
+	options := &helm.Options{
+		Logger: logger.Discard,
+		SetValues: map[string]string{
+			"githubConfigUrl":                    "https://github.com/actions",
+			"githubConfigSecret.github_token":    "gh_token12345",
+			"containerMode.type":                 "kubernetes-novolume",
+			"controllerServiceAccount.name":      "arc",
+			"controllerServiceAccount.namespace": "arc-system",
+		},
+		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
+	}
+
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+
+	var ars v1alpha1.AutoscalingRunnerSet
+	helm.UnmarshalK8SYaml(t, output, &ars)
+
+	assert.Equal(t, namespaceName, ars.Namespace)
+	assert.Equal(t, "test-runners", ars.Name)
+
+	assert.Equal(t, "test-runners", ars.Labels["app.kubernetes.io/name"])
+	assert.Equal(t, "test-runners", ars.Labels["app.kubernetes.io/instance"])
+	assert.Equal(t, "https://github.com/actions", ars.Spec.GitHubConfigUrl)
+	assert.Equal(t, "test-runners-gha-rs-github-secret", ars.Spec.GitHubConfigSecret)
+
+	assert.Empty(t, ars.Spec.RunnerGroup, "RunnerGroup should be empty")
+	assert.Nil(t, ars.Spec.MinRunners, "MinRunners should be nil")
+	assert.Nil(t, ars.Spec.MaxRunners, "MaxRunners should be nil")
+	assert.Nil(t, ars.Spec.Proxy, "Proxy should be nil")
+	assert.Nil(t, ars.Spec.GitHubServerTLS, "GitHubServerTLS should be nil")
+
+	assert.NotNil(t, ars.Spec.Template.Spec, "Template.Spec should not be nil")
+
+	assert.Len(t, ars.Spec.Template.Spec.Containers, 1, "Template.Spec should have 1 container")
+	assert.Equal(t, "runner", ars.Spec.Template.Spec.Containers[0].Name)
+	assert.Equal(t, "ghcr.io/actions/actions-runner:latest", ars.Spec.Template.Spec.Containers[0].Image)
+
+	require.Len(t, ars.Spec.Template.Spec.Containers[0].Env, 4, "The runner container should have 4 env vars")
+	assert.Equal(t, "ACTIONS_RUNNER_CONTAINER_HOOKS", ars.Spec.Template.Spec.Containers[0].Env[0].Name)
+	assert.Equal(t, "/home/runner/k8s-novolume/index.js", ars.Spec.Template.Spec.Containers[0].Env[0].Value)
+	assert.Equal(t, "ACTIONS_RUNNER_POD_NAME", ars.Spec.Template.Spec.Containers[0].Env[1].Name)
+	assert.Equal(t, "ACTIONS_RUNNER_REQUIRE_JOB_CONTAINER", ars.Spec.Template.Spec.Containers[0].Env[2].Name)
+	assert.Equal(t, "true", ars.Spec.Template.Spec.Containers[0].Env[2].Value)
+	assert.Equal(t, "ACTIONS_RUNNER_IMAGE", ars.Spec.Template.Spec.Containers[0].Env[3].Name)
+	assert.Equal(t, ars.Spec.Template.Spec.Containers[0].Image, ars.Spec.Template.Spec.Containers[0].Env[3].Value)
+
+	assert.Len(t, ars.Spec.Template.Spec.Volumes, 0, "Template.Spec should have 0 volumes")
+	assert.NotNil(t, ars.Spec.Template.Spec.Volumes, "Template.Spec.Volumes should be non-nil empty slice, not null")
+
+	// Regression check: ensure volumeMounts is also non-nil empty slice for kubernetes-novolume
+	runnerContainer := ars.Spec.Template.Spec.Containers[0]
+	assert.NotNil(t, runnerContainer.VolumeMounts, "runner container VolumeMounts should be non-nil empty slice, not null")
+	assert.Len(t, runnerContainer.VolumeMounts, 0, "runner container should have 0 volumeMounts in kubernetes-novolume mode")
+}
+
+func TestTemplateRenderedAutoScalingRunnerSet_EnableKubernetesModeNoVolume_WithCustomVolumes(t *testing.T) {
+	t.Parallel()
+
+	// Path to the helm chart we will test
+	helmChartPath, err := filepath.Abs("../../gha-runner-scale-set")
+	require.NoError(t, err)
+
+	testValuesPath, err := filepath.Abs("../tests/values_k8s_novolume_custom_volumes.yaml")
+	require.NoError(t, err)
+
+	releaseName := "test-runners"
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
+
+	// Test that user-provided volumes are preserved even in kubernetes-novolume mode
+	options := &helm.Options{
+		Logger:         logger.Discard,
+		ValuesFiles:    []string{testValuesPath},
+		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
+	}
+
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+
+	var ars v1alpha1.AutoscalingRunnerSet
+	helm.UnmarshalK8SYaml(t, output, &ars)
+
+	// Override preservation: user-provided volume should be present, not replaced by empty array
+	assert.Len(t, ars.Spec.Template.Spec.Volumes, 1, "Template.Spec should have 1 volume (user-provided override)")
+	assert.Equal(t, "custom-volume", ars.Spec.Template.Spec.Volumes[0].Name, "Volume name should be preserved as custom-volume")
+	assert.NotNil(t, ars.Spec.Template.Spec.Volumes[0].EmptyDir, "Volume should have EmptyDir configured")
+}
+
+func TestTemplateRenderedAutoScalingRunnerSet_EnableKubernetesModeNoVolume_WithCustomVolumeMounts(t *testing.T) {
+	t.Parallel()
+
+	// Path to the helm chart we will test
+	helmChartPath, err := filepath.Abs("../../gha-runner-scale-set")
+	require.NoError(t, err)
+
+	testValuesPath, err := filepath.Abs("../tests/values_k8s_novolume_custom_volume_mounts.yaml")
+	require.NoError(t, err)
+
+	releaseName := "test-runners"
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
+
+	// Test that user-provided volumeMounts are preserved in kubernetes-novolume runner container
+	options := &helm.Options{
+		Logger:         logger.Discard,
+		ValuesFiles:    []string{testValuesPath},
+		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
+	}
+
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+
+	var ars v1alpha1.AutoscalingRunnerSet
+	helm.UnmarshalK8SYaml(t, output, &ars)
+
+	runnerContainer := ars.Spec.Template.Spec.Containers[0]
+	// Override preservation: user-provided volumeMounts should be present, not replaced by empty array
+	assert.Len(t, runnerContainer.VolumeMounts, 1, "runner container should have 1 volumeMount (user-provided override)")
+	assert.Equal(t, "custom-volume", runnerContainer.VolumeMounts[0].Name, "VolumeMount name should be preserved as custom-volume")
+	assert.Equal(t, "/mnt/custom", runnerContainer.VolumeMounts[0].MountPath, "VolumeMount path should be preserved as /mnt/custom")
+}
+
 func TestTemplateRenderedAutoscalingRunnerSet_ListenerPodTemplate(t *testing.T) {
 	t.Parallel()
 
@@ -972,7 +1395,7 @@ func TestTemplateRenderedAutoscalingRunnerSet_ListenerPodTemplate(t *testing.T) 
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger: logger.Discard,
@@ -984,7 +1407,7 @@ func TestTemplateRenderedAutoscalingRunnerSet_ListenerPodTemplate(t *testing.T) 
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	output := helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
 
 	var ars v1alpha1.AutoscalingRunnerSet
 	helm.UnmarshalK8SYaml(t, output, &ars)
@@ -1013,7 +1436,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_UsePredefinedSecret(t *testing.T) 
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger: logger.Discard,
@@ -1026,7 +1449,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_UsePredefinedSecret(t *testing.T) 
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	output := helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
 
 	var ars v1alpha1.AutoscalingRunnerSet
 	helm.UnmarshalK8SYaml(t, output, &ars)
@@ -1048,7 +1471,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_ErrorOnEmptyPredefinedSecret(t *te
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger: logger.Discard,
@@ -1061,7 +1484,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_ErrorOnEmptyPredefinedSecret(t *te
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	_, err = helm.RenderTemplateE(t, options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+	_, err = helm.RenderTemplateContextE(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
 	require.Error(t, err)
 
 	assert.ErrorContains(t, err, "Values.githubConfigSecret is required for setting auth with GitHub server")
@@ -1075,7 +1498,7 @@ func TestTemplateRenderedWithProxy(t *testing.T) {
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger: logger.Discard,
@@ -1093,7 +1516,7 @@ func TestTemplateRenderedWithProxy(t *testing.T) {
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	output := helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
 
 	var ars v1alpha1.AutoscalingRunnerSet
 	helm.UnmarshalK8SYaml(t, output, &ars)
@@ -1116,7 +1539,7 @@ func TestTemplateRenderedWithProxy(t *testing.T) {
 func TestTemplateRenderedWithTLS(t *testing.T) {
 	t.Parallel()
 
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	render := func(t *testing.T, options *helm.Options) v1alpha1.AutoscalingRunnerSet {
 		// Path to the helm chart we will test
@@ -1125,8 +1548,9 @@ func TestTemplateRenderedWithTLS(t *testing.T) {
 
 		releaseName := "test-runners"
 
-		output := helm.RenderTemplate(
+		output := helm.RenderTemplateContext(
 			t,
+			t.Context(),
 			options,
 			helmChartPath,
 			releaseName,
@@ -1140,7 +1564,7 @@ func TestTemplateRenderedWithTLS(t *testing.T) {
 	}
 
 	t.Run("providing githubServerTLS.runnerMountPath", func(t *testing.T) {
-		t.Run("mode: default", func(t *testing.T) {
+		t.Run("mode default", func(t *testing.T) {
 			options := &helm.Options{
 				Logger: logger.Discard,
 				SetValues: map[string]string{
@@ -1158,7 +1582,7 @@ func TestTemplateRenderedWithTLS(t *testing.T) {
 			ars := render(t, options)
 
 			require.NotNil(t, ars.Spec.GitHubServerTLS)
-			expected := &v1alpha1.GitHubServerTLSConfig{
+			expected := &v1alpha1.TLSConfig{
 				CertificateFrom: &v1alpha1.TLSCertificateSource{
 					ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
 						LocalObjectReference: corev1.LocalObjectReference{
@@ -1199,7 +1623,7 @@ func TestTemplateRenderedWithTLS(t *testing.T) {
 			})
 		})
 
-		t.Run("mode: dind", func(t *testing.T) {
+		t.Run("mode dind", func(t *testing.T) {
 			options := &helm.Options{
 				Logger: logger.Discard,
 				SetValues: map[string]string{
@@ -1218,7 +1642,7 @@ func TestTemplateRenderedWithTLS(t *testing.T) {
 			ars := render(t, options)
 
 			require.NotNil(t, ars.Spec.GitHubServerTLS)
-			expected := &v1alpha1.GitHubServerTLSConfig{
+			expected := &v1alpha1.TLSConfig{
 				CertificateFrom: &v1alpha1.TLSCertificateSource{
 					ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
 						LocalObjectReference: corev1.LocalObjectReference{
@@ -1259,7 +1683,7 @@ func TestTemplateRenderedWithTLS(t *testing.T) {
 			})
 		})
 
-		t.Run("mode: kubernetes", func(t *testing.T) {
+		t.Run("mode kubernetes", func(t *testing.T) {
 			options := &helm.Options{
 				Logger: logger.Discard,
 				SetValues: map[string]string{
@@ -1278,7 +1702,67 @@ func TestTemplateRenderedWithTLS(t *testing.T) {
 			ars := render(t, options)
 
 			require.NotNil(t, ars.Spec.GitHubServerTLS)
-			expected := &v1alpha1.GitHubServerTLSConfig{
+			expected := &v1alpha1.TLSConfig{
+				CertificateFrom: &v1alpha1.TLSCertificateSource{
+					ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: "certs-configmap",
+						},
+						Key: "cert.pem",
+					},
+				},
+			}
+			assert.Equal(t, expected, ars.Spec.GitHubServerTLS)
+
+			var volume *corev1.Volume
+			for _, v := range ars.Spec.Template.Spec.Volumes {
+				if v.Name == "github-server-tls-cert" {
+					volume = &v
+					break
+				}
+			}
+			require.NotNil(t, volume)
+			assert.Equal(t, "certs-configmap", volume.ConfigMap.Name)
+			assert.Equal(t, "cert.pem", volume.ConfigMap.Items[0].Key)
+			assert.Equal(t, "cert.pem", volume.ConfigMap.Items[0].Path)
+
+			assert.Contains(t, ars.Spec.Template.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{
+				Name:      "github-server-tls-cert",
+				MountPath: "/runner/mount/path/cert.pem",
+				SubPath:   "cert.pem",
+			})
+
+			assert.Contains(t, ars.Spec.Template.Spec.Containers[0].Env, corev1.EnvVar{
+				Name:  "NODE_EXTRA_CA_CERTS",
+				Value: "/runner/mount/path/cert.pem",
+			})
+
+			assert.Contains(t, ars.Spec.Template.Spec.Containers[0].Env, corev1.EnvVar{
+				Name:  "RUNNER_UPDATE_CA_CERTS",
+				Value: "1",
+			})
+		})
+
+		t.Run("mode kubernetes-novolume", func(t *testing.T) {
+			options := &helm.Options{
+				Logger: logger.Discard,
+				SetValues: map[string]string{
+					"githubConfigUrl":    "https://github.com/actions",
+					"githubConfigSecret": "pre-defined-secrets",
+					"githubServerTLS.certificateFrom.configMapKeyRef.name": "certs-configmap",
+					"githubServerTLS.certificateFrom.configMapKeyRef.key":  "cert.pem",
+					"githubServerTLS.runnerMountPath":                      "/runner/mount/path",
+					"containerMode.type":                                   "kubernetes-novolume",
+					"controllerServiceAccount.name":                        "arc",
+					"controllerServiceAccount.namespace":                   "arc-system",
+				},
+				KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
+			}
+
+			ars := render(t, options)
+
+			require.NotNil(t, ars.Spec.GitHubServerTLS)
+			expected := &v1alpha1.TLSConfig{
 				CertificateFrom: &v1alpha1.TLSCertificateSource{
 					ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
 						LocalObjectReference: corev1.LocalObjectReference{
@@ -1321,7 +1805,7 @@ func TestTemplateRenderedWithTLS(t *testing.T) {
 	})
 
 	t.Run("without providing githubServerTLS.runnerMountPath", func(t *testing.T) {
-		t.Run("mode: default", func(t *testing.T) {
+		t.Run("mode default", func(t *testing.T) {
 			options := &helm.Options{
 				Logger: logger.Discard,
 				SetValues: map[string]string{
@@ -1338,7 +1822,7 @@ func TestTemplateRenderedWithTLS(t *testing.T) {
 			ars := render(t, options)
 
 			require.NotNil(t, ars.Spec.GitHubServerTLS)
-			expected := &v1alpha1.GitHubServerTLSConfig{
+			expected := &v1alpha1.TLSConfig{
 				CertificateFrom: &v1alpha1.TLSCertificateSource{
 					ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
 						LocalObjectReference: corev1.LocalObjectReference{
@@ -1376,7 +1860,7 @@ func TestTemplateRenderedWithTLS(t *testing.T) {
 			})
 		})
 
-		t.Run("mode: dind", func(t *testing.T) {
+		t.Run("mode dind", func(t *testing.T) {
 			options := &helm.Options{
 				Logger: logger.Discard,
 				SetValues: map[string]string{
@@ -1394,7 +1878,7 @@ func TestTemplateRenderedWithTLS(t *testing.T) {
 			ars := render(t, options)
 
 			require.NotNil(t, ars.Spec.GitHubServerTLS)
-			expected := &v1alpha1.GitHubServerTLSConfig{
+			expected := &v1alpha1.TLSConfig{
 				CertificateFrom: &v1alpha1.TLSCertificateSource{
 					ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
 						LocalObjectReference: corev1.LocalObjectReference{
@@ -1432,7 +1916,7 @@ func TestTemplateRenderedWithTLS(t *testing.T) {
 			})
 		})
 
-		t.Run("mode: kubernetes", func(t *testing.T) {
+		t.Run("mode kubernetes", func(t *testing.T) {
 			options := &helm.Options{
 				Logger: logger.Discard,
 				SetValues: map[string]string{
@@ -1450,7 +1934,63 @@ func TestTemplateRenderedWithTLS(t *testing.T) {
 			ars := render(t, options)
 
 			require.NotNil(t, ars.Spec.GitHubServerTLS)
-			expected := &v1alpha1.GitHubServerTLSConfig{
+			expected := &v1alpha1.TLSConfig{
+				CertificateFrom: &v1alpha1.TLSCertificateSource{
+					ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: "certs-configmap",
+						},
+						Key: "cert.pem",
+					},
+				},
+			}
+			assert.Equal(t, expected, ars.Spec.GitHubServerTLS)
+
+			var volume *corev1.Volume
+			for _, v := range ars.Spec.Template.Spec.Volumes {
+				if v.Name == "github-server-tls-cert" {
+					volume = &v
+					break
+				}
+			}
+			assert.Nil(t, volume)
+
+			assert.NotContains(t, ars.Spec.Template.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{
+				Name:      "github-server-tls-cert",
+				MountPath: "/runner/mount/path/cert.pem",
+				SubPath:   "cert.pem",
+			})
+
+			assert.NotContains(t, ars.Spec.Template.Spec.Containers[0].Env, corev1.EnvVar{
+				Name:  "NODE_EXTRA_CA_CERTS",
+				Value: "/runner/mount/path/cert.pem",
+			})
+
+			assert.NotContains(t, ars.Spec.Template.Spec.Containers[0].Env, corev1.EnvVar{
+				Name:  "RUNNER_UPDATE_CA_CERTS",
+				Value: "1",
+			})
+		})
+
+		t.Run("mode kubernetes-novolume", func(t *testing.T) {
+			options := &helm.Options{
+				Logger: logger.Discard,
+				SetValues: map[string]string{
+					"githubConfigUrl":    "https://github.com/actions",
+					"githubConfigSecret": "pre-defined-secrets",
+					"githubServerTLS.certificateFrom.configMapKeyRef.name": "certs-configmap",
+					"githubServerTLS.certificateFrom.configMapKeyRef.key":  "cert.pem",
+					"containerMode.type":                 "kubernetes-novolume",
+					"controllerServiceAccount.name":      "arc",
+					"controllerServiceAccount.namespace": "arc-system",
+				},
+				KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
+			}
+
+			ars := render(t, options)
+
+			require.NotNil(t, ars.Spec.GitHubServerTLS)
+			expected := &v1alpha1.TLSConfig{
 				CertificateFrom: &v1alpha1.TLSCertificateSource{
 					ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
 						LocalObjectReference: corev1.LocalObjectReference{
@@ -1511,11 +2051,11 @@ func TestTemplateNamingConstraints(t *testing.T) {
 	}{
 		"Name too long": {
 			releaseName:   strings.Repeat("a", 46),
-			namespaceName: "test-" + strings.ToLower(random.UniqueId()),
+			namespaceName: "test-" + strings.ToLower(random.UniqueID()),
 			expectedError: "Name must have up to 45 characters",
 		},
 		"Namespace too long": {
-			releaseName:   "test-" + strings.ToLower(random.UniqueId()),
+			releaseName:   "test-" + strings.ToLower(random.UniqueID()),
 			namespaceName: strings.Repeat("a", 64),
 			expectedError: "Namespace must have up to 63 characters",
 		},
@@ -1528,7 +2068,7 @@ func TestTemplateNamingConstraints(t *testing.T) {
 				SetValues:      setValues,
 				KubectlOptions: k8s.NewKubectlOptions("", "", tc.namespaceName),
 			}
-			_, err = helm.RenderTemplateE(t, options, helmChartPath, tc.releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+			_, err = helm.RenderTemplateContextE(t, t.Context(), options, helmChartPath, tc.releaseName, []string{"templates/autoscalingrunnerset.yaml"})
 			require.Error(t, err)
 			assert.ErrorContains(t, err, tc.expectedError)
 		})
@@ -1543,7 +2083,7 @@ func TestTemplateRenderedGitHubConfigUrlEndsWIthSlash(t *testing.T) {
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger: logger.Discard,
@@ -1556,7 +2096,7 @@ func TestTemplateRenderedGitHubConfigUrlEndsWIthSlash(t *testing.T) {
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	output := helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
 
 	var ars v1alpha1.AutoscalingRunnerSet
 	helm.UnmarshalK8SYaml(t, output, &ars)
@@ -1574,7 +2114,7 @@ func TestTemplate_CreateManagerRole(t *testing.T) {
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger: logger.Discard,
@@ -1587,7 +2127,7 @@ func TestTemplate_CreateManagerRole(t *testing.T) {
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	output := helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/manager_role.yaml"})
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/manager_role.yaml"})
 
 	var managerRole rbacv1.Role
 	helm.UnmarshalK8SYaml(t, output, &managerRole)
@@ -1609,7 +2149,7 @@ func TestTemplate_CreateManagerRole_UseConfigMaps(t *testing.T) {
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger: logger.Discard,
@@ -1623,7 +2163,7 @@ func TestTemplate_CreateManagerRole_UseConfigMaps(t *testing.T) {
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	output := helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/manager_role.yaml"})
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/manager_role.yaml"})
 
 	var managerRole rbacv1.Role
 	helm.UnmarshalK8SYaml(t, output, &managerRole)
@@ -1643,7 +2183,7 @@ func TestTemplate_CreateManagerRoleBinding(t *testing.T) {
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger: logger.Discard,
@@ -1656,7 +2196,7 @@ func TestTemplate_CreateManagerRoleBinding(t *testing.T) {
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	output := helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/manager_role_binding.yaml"})
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/manager_role_binding.yaml"})
 
 	var managerRoleBinding rbacv1.RoleBinding
 	helm.UnmarshalK8SYaml(t, output, &managerRoleBinding)
@@ -1680,7 +2220,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_ExtraContainers(t *testing.T) {
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger: logger.Discard,
@@ -1692,7 +2232,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_ExtraContainers(t *testing.T) {
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	output := helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"}, "--debug")
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"}, "--debug")
 
 	var ars v1alpha1.AutoscalingRunnerSet
 	helm.UnmarshalK8SYaml(t, output, &ars)
@@ -1725,7 +2265,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_RestartPolicy(t *testing.T) {
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger: logger.Discard,
@@ -1738,7 +2278,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_RestartPolicy(t *testing.T) {
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	output := helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
 
 	var ars v1alpha1.AutoscalingRunnerSet
 	helm.UnmarshalK8SYaml(t, output, &ars)
@@ -1757,7 +2297,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_RestartPolicy(t *testing.T) {
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	output = helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"}, "--debug")
+	output = helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"}, "--debug")
 
 	helm.UnmarshalK8SYaml(t, output, &ars)
 
@@ -1775,7 +2315,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_ExtraPodSpec(t *testing.T) {
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger: logger.Discard,
@@ -1787,7 +2327,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_ExtraPodSpec(t *testing.T) {
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	output := helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
 
 	var ars v1alpha1.AutoscalingRunnerSet
 	helm.UnmarshalK8SYaml(t, output, &ars)
@@ -1809,7 +2349,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_DinDMergePodSpec(t *testing.T) {
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger: logger.Discard,
@@ -1821,12 +2361,12 @@ func TestTemplateRenderedAutoScalingRunnerSet_DinDMergePodSpec(t *testing.T) {
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	output := helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"}, "--debug")
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"}, "--debug")
 
 	var ars v1alpha1.AutoscalingRunnerSet
 	helm.UnmarshalK8SYaml(t, output, &ars)
 
-	assert.Len(t, ars.Spec.Template.Spec.Containers, 2, "There should be 2 containers")
+	assert.Len(t, ars.Spec.Template.Spec.Containers, 1, "There should be 1 containers")
 	assert.Equal(t, "runner", ars.Spec.Template.Spec.Containers[0].Name, "Container name should be runner")
 	assert.Equal(t, "250m", ars.Spec.Template.Spec.Containers[0].Resources.Limits.Cpu().String(), "CPU Limit should be set")
 	assert.Equal(t, "64Mi", ars.Spec.Template.Spec.Containers[0].Resources.Limits.Memory().String(), "Memory Limit should be set")
@@ -1851,7 +2391,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_KubeModeMergePodSpec(t *testing.T)
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger: logger.Discard,
@@ -1863,7 +2403,7 @@ func TestTemplateRenderedAutoScalingRunnerSet_KubeModeMergePodSpec(t *testing.T)
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	output := helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"}, "--debug")
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"}, "--debug")
 
 	var ars v1alpha1.AutoscalingRunnerSet
 	helm.UnmarshalK8SYaml(t, output, &ars)
@@ -1892,7 +2432,7 @@ func TestTemplateRenderedAutoscalingRunnerSetAnnotation_GitHubSecret(t *testing.
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	annotationExpectedTests := map[string]*helm.Options{
 		"GitHub token": {
@@ -1921,7 +2461,7 @@ func TestTemplateRenderedAutoscalingRunnerSetAnnotation_GitHubSecret(t *testing.
 
 	for name, options := range annotationExpectedTests {
 		t.Run("Annotation set: "+name, func(t *testing.T) {
-			output := helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+			output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
 			var autoscalingRunnerSet v1alpha1.AutoscalingRunnerSet
 			helm.UnmarshalK8SYaml(t, output, &autoscalingRunnerSet)
 
@@ -1940,7 +2480,7 @@ func TestTemplateRenderedAutoscalingRunnerSetAnnotation_GitHubSecret(t *testing.
 			},
 			KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 		}
-		output := helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+		output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
 		var autoscalingRunnerSet v1alpha1.AutoscalingRunnerSet
 		helm.UnmarshalK8SYaml(t, output, &autoscalingRunnerSet)
 
@@ -1951,40 +2491,44 @@ func TestTemplateRenderedAutoscalingRunnerSetAnnotation_GitHubSecret(t *testing.
 func TestTemplateRenderedAutoscalingRunnerSetAnnotation_KubernetesModeCleanup(t *testing.T) {
 	t.Parallel()
 
-	// Path to the helm chart we will test
-	helmChartPath, err := filepath.Abs("../../gha-runner-scale-set")
-	require.NoError(t, err)
+	for _, mode := range []string{"kubernetes", "kubernetes-novolume"} {
+		t.Run("containerMode "+mode, func(t *testing.T) {
+			// Path to the helm chart we will test
+			helmChartPath, err := filepath.Abs("../../gha-runner-scale-set")
+			require.NoError(t, err)
 
-	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+			releaseName := "test-runners"
+			namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
-	options := &helm.Options{
-		Logger: logger.Discard,
-		SetValues: map[string]string{
-			"githubConfigUrl":                    "https://github.com/actions",
-			"githubConfigSecret.github_token":    "gh_token12345",
-			"controllerServiceAccount.name":      "arc",
-			"controllerServiceAccount.namespace": "arc-system",
-			"containerMode.type":                 "kubernetes",
-		},
-		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
-	}
+			options := &helm.Options{
+				Logger: logger.Discard,
+				SetValues: map[string]string{
+					"githubConfigUrl":                    "https://github.com/actions",
+					"githubConfigSecret.github_token":    "gh_token12345",
+					"controllerServiceAccount.name":      "arc",
+					"controllerServiceAccount.namespace": "arc-system",
+					"containerMode.type":                 mode,
+				},
+				KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
+			}
 
-	output := helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
-	var autoscalingRunnerSet v1alpha1.AutoscalingRunnerSet
-	helm.UnmarshalK8SYaml(t, output, &autoscalingRunnerSet)
+			output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+			var autoscalingRunnerSet v1alpha1.AutoscalingRunnerSet
+			helm.UnmarshalK8SYaml(t, output, &autoscalingRunnerSet)
 
-	annotationValues := map[string]string{
-		actionsgithubcom.AnnotationKeyGitHubSecretName:                 "test-runners-gha-rs-github-secret",
-		actionsgithubcom.AnnotationKeyManagerRoleName:                  "test-runners-gha-rs-manager",
-		actionsgithubcom.AnnotationKeyManagerRoleBindingName:           "test-runners-gha-rs-manager",
-		actionsgithubcom.AnnotationKeyKubernetesModeServiceAccountName: "test-runners-gha-rs-kube-mode",
-		actionsgithubcom.AnnotationKeyKubernetesModeRoleName:           "test-runners-gha-rs-kube-mode",
-		actionsgithubcom.AnnotationKeyKubernetesModeRoleBindingName:    "test-runners-gha-rs-kube-mode",
-	}
+			annotationValues := map[string]string{
+				actionsgithubcom.AnnotationKeyGitHubSecretName:                 "test-runners-gha-rs-github-secret",
+				actionsgithubcom.AnnotationKeyManagerRoleName:                  "test-runners-gha-rs-manager",
+				actionsgithubcom.AnnotationKeyManagerRoleBindingName:           "test-runners-gha-rs-manager",
+				actionsgithubcom.AnnotationKeyKubernetesModeServiceAccountName: "test-runners-gha-rs-kube-mode",
+				actionsgithubcom.AnnotationKeyKubernetesModeRoleName:           "test-runners-gha-rs-kube-mode",
+				actionsgithubcom.AnnotationKeyKubernetesModeRoleBindingName:    "test-runners-gha-rs-kube-mode",
+			}
 
-	for annotation, value := range annotationValues {
-		assert.Equal(t, value, autoscalingRunnerSet.Annotations[annotation], fmt.Sprintf("Annotation %q does not match the expected value", annotation))
+			for annotation, value := range annotationValues {
+				assert.Equal(t, value, autoscalingRunnerSet.Annotations[annotation], fmt.Sprintf("Annotation %q does not match the expected value", annotation))
+			}
+		})
 	}
 }
 
@@ -1999,7 +2543,7 @@ func TestRunnerContainerEnvNotEmptyMap(t *testing.T) {
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger:         logger.Discard,
@@ -2007,7 +2551,7 @@ func TestRunnerContainerEnvNotEmptyMap(t *testing.T) {
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	output := helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
 	type testModel struct {
 		Spec struct {
 			Template struct {
@@ -2035,7 +2579,7 @@ func TestRunnerContainerVolumeNotEmptyMap(t *testing.T) {
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger:         logger.Discard,
@@ -2043,7 +2587,7 @@ func TestRunnerContainerVolumeNotEmptyMap(t *testing.T) {
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	output := helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
 	type testModel struct {
 		Spec struct {
 			Template struct {
@@ -2070,7 +2614,7 @@ func TestAutoscalingRunnerSetAnnotationValuesHash(t *testing.T) {
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger: logger.Discard,
@@ -2083,7 +2627,7 @@ func TestAutoscalingRunnerSetAnnotationValuesHash(t *testing.T) {
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	output := helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
 
 	var autoscalingRunnerSet v1alpha1.AutoscalingRunnerSet
 	helm.UnmarshalK8SYaml(t, output, &autoscalingRunnerSet)
@@ -2106,7 +2650,7 @@ func TestAutoscalingRunnerSetAnnotationValuesHash(t *testing.T) {
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	output = helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+	output = helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
 
 	helm.UnmarshalK8SYaml(t, output, &autoscalingRunnerSet)
 	secondHash := autoscalingRunnerSet.Annotations[valuesHash]
@@ -2123,7 +2667,7 @@ func TestCustomLabels(t *testing.T) {
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger: logger.Discard,
@@ -2133,7 +2677,7 @@ func TestCustomLabels(t *testing.T) {
 			"controllerServiceAccount.name":                                "arc",
 			"containerMode.type":                                           "kubernetes",
 			"controllerServiceAccount.namespace":                           "arc-system",
-			`labels.argocd\.argoproj\.io/sync-wave`:                        `"1"`,
+			`labels.argocd\.argoproj\.io/sync-wave`:                        "1",
 			`labels.app\.kubernetes\.io/part-of`:                           "no-override", // this shouldn't be overwritten
 			"resourceMeta.autoscalingRunnerSet.labels.ars-custom":          "ars-custom-value",
 			"resourceMeta.githubConfigSecret.labels.gh-custom":             "gh-custom-value",
@@ -2142,14 +2686,22 @@ func TestCustomLabels(t *testing.T) {
 			"resourceMeta.kubernetesModeServiceAccount.labels.kmsa-custom": "kmsa-custom-value",
 			"resourceMeta.managerRole.labels.mr-custom":                    "mr-custom-value",
 			"resourceMeta.managerRoleBinding.labels.mrb-custom":            "mrb-custom-value",
+			"resourceMeta.autoscalingListener.labels.al-custom":            "al-custom-value",
+			"resourceMeta.listenerServiceAccount.labels.lsa-custom":        "lsa-custom-value",
+			"resourceMeta.listenerRole.labels.lr-custom":                   "lr-custom-value",
+			"resourceMeta.listenerRoleBinding.labels.lrb-custom":           "lrb-custom-value",
+			"resourceMeta.listenerConfigSecret.labels.lcs-custom":          "lcs-custom-value",
+			"resourceMeta.ephemeralRunnerSet.labels.ers-custom":            "ers-custom-value",
+			"resourceMeta.ephemeralRunner.labels.er-custom":                "er-custom-value",
+			"resourceMeta.ephemeralRunnerConfigSecret.labels.ercs-custom":  "ercs-custom-value",
 		},
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	output := helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/githubsecret.yaml"})
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/githubsecret.yaml"})
 
 	const targetLabel = "argocd.argoproj.io/sync-wave"
-	const wantCustomValue = `"1"`
+	const wantCustomValue = "1"
 	const reservedLabel = "app.kubernetes.io/part-of"
 	const wantReservedValue = "gha-rs"
 
@@ -2159,42 +2711,58 @@ func TestCustomLabels(t *testing.T) {
 	assert.Equal(t, wantReservedValue, githubSecret.Labels[reservedLabel])
 	assert.Equal(t, "gh-custom-value", githubSecret.Labels["gh-custom"])
 
-	output = helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/kube_mode_role.yaml"})
+	output = helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/kube_mode_role.yaml"})
 	var role rbacv1.Role
 	helm.UnmarshalK8SYaml(t, output, &role)
 	assert.Equal(t, wantCustomValue, role.Labels[targetLabel])
 	assert.Equal(t, wantReservedValue, role.Labels[reservedLabel])
 	assert.Equal(t, "kmr-custom-value", role.Labels["kmr-custom"])
 
-	output = helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/kube_mode_role_binding.yaml"})
+	output = helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/kube_mode_role_binding.yaml"})
 	var roleBinding rbacv1.RoleBinding
 	helm.UnmarshalK8SYaml(t, output, &roleBinding)
 	assert.Equal(t, wantCustomValue, roleBinding.Labels[targetLabel])
 	assert.Equal(t, wantReservedValue, roleBinding.Labels[reservedLabel])
 	assert.Equal(t, "kmrb-custom-value", roleBinding.Labels["kmrb-custom"])
 
-	output = helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+	output = helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
 	var ars v1alpha1.AutoscalingRunnerSet
 	helm.UnmarshalK8SYaml(t, output, &ars)
 	assert.Equal(t, wantCustomValue, ars.Labels[targetLabel])
 	assert.Equal(t, wantReservedValue, ars.Labels[reservedLabel])
 	assert.Equal(t, "ars-custom-value", ars.Labels["ars-custom"])
+	require.NotNil(t, ars.Spec.AutoscalingListenerMetadata)
+	assert.Equal(t, "al-custom-value", ars.Spec.AutoscalingListenerMetadata.Labels["al-custom"])
+	require.NotNil(t, ars.Spec.ListenerServiceAccountMetadata)
+	assert.Equal(t, "lsa-custom-value", ars.Spec.ListenerServiceAccountMetadata.Labels["lsa-custom"])
+	require.NotNil(t, ars.Spec.ListenerRoleMetadata)
+	assert.Equal(t, "lr-custom-value", ars.Spec.ListenerRoleMetadata.Labels["lr-custom"])
+	require.NotNil(t, ars.Spec.ListenerRoleBindingMetadata)
+	assert.Equal(t, "lrb-custom-value", ars.Spec.ListenerRoleBindingMetadata.Labels["lrb-custom"])
+	require.NotNil(t, ars.Spec.ListenerConfigSecretMetadata)
+	assert.Equal(t, "lcs-custom-value", ars.Spec.ListenerConfigSecretMetadata.Labels["lcs-custom"])
+	require.NotNil(t, ars.Spec.EphemeralRunnerSetMetadata)
+	assert.Equal(t, "ers-custom-value", ars.Spec.EphemeralRunnerSetMetadata.Labels["ers-custom"])
+	require.NotNil(t, ars.Spec.EphemeralRunnerMetadata)
+	assert.Equal(t, "er-custom-value", ars.Spec.EphemeralRunnerMetadata.Labels["er-custom"])
+	require.NotNil(t, ars.Spec.EphemeralRunnerConfigSecretMetadata)
+	assert.Equal(t, "ercs-custom-value", ars.Spec.EphemeralRunnerConfigSecretMetadata.Labels["ercs-custom"])
 
-	output = helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/kube_mode_serviceaccount.yaml"})
+	output = helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/kube_mode_serviceaccount.yaml"})
 	var serviceAccount corev1.ServiceAccount
 	helm.UnmarshalK8SYaml(t, output, &serviceAccount)
 	assert.Equal(t, wantCustomValue, serviceAccount.Labels[targetLabel])
 	assert.Equal(t, wantReservedValue, serviceAccount.Labels[reservedLabel])
 	assert.Equal(t, "kmsa-custom-value", serviceAccount.Labels["kmsa-custom"])
 
-	output = helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/manager_role.yaml"})
+	output = helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/manager_role.yaml"})
 	var managerRole rbacv1.Role
 	helm.UnmarshalK8SYaml(t, output, &managerRole)
 	assert.Equal(t, wantCustomValue, managerRole.Labels[targetLabel])
 	assert.Equal(t, wantReservedValue, managerRole.Labels[reservedLabel])
 	assert.Equal(t, "mr-custom-value", managerRole.Labels["mr-custom"])
 
-	output = helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/manager_role_binding.yaml"})
+	output = helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/manager_role_binding.yaml"})
 	var managerRoleBinding rbacv1.RoleBinding
 	helm.UnmarshalK8SYaml(t, output, &managerRoleBinding)
 	assert.Equal(t, wantCustomValue, managerRoleBinding.Labels[targetLabel])
@@ -2208,13 +2776,13 @@ func TestCustomLabels(t *testing.T) {
 			"githubConfigSecret.github_token":                            "gh_token12345",
 			"controllerServiceAccount.name":                              "arc",
 			"controllerServiceAccount.namespace":                         "arc-system",
-			`labels.argocd\.argoproj\.io/sync-wave`:                      `"1"`,
+			`labels.argocd\.argoproj\.io/sync-wave`:                      "1",
 			"resourceMeta.noPermissionServiceAccount.labels.npsa-custom": "npsa-custom-value",
 		},
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	output = helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/no_permission_serviceaccount.yaml"})
+	output = helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/no_permission_serviceaccount.yaml"})
 	var noPermissionServiceAccount corev1.ServiceAccount
 	helm.UnmarshalK8SYaml(t, output, &noPermissionServiceAccount)
 	assert.Equal(t, wantCustomValue, noPermissionServiceAccount.Labels[targetLabel])
@@ -2230,7 +2798,7 @@ func TestCustomAnnotations(t *testing.T) {
 	require.NoError(t, err)
 
 	releaseName := "test-runners"
-	namespaceName := "test-" + strings.ToLower(random.UniqueId())
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
 
 	options := &helm.Options{
 		Logger: logger.Discard,
@@ -2240,7 +2808,7 @@ func TestCustomAnnotations(t *testing.T) {
 			"containerMode.type":                                                "kubernetes",
 			"controllerServiceAccount.name":                                     "arc",
 			"controllerServiceAccount.namespace":                                "arc-system",
-			`annotations.argocd\.argoproj\.io/sync-wave`:                        `"1"`,
+			`annotations.argocd\.argoproj\.io/sync-wave`:                        "1",
 			"resourceMeta.autoscalingRunnerSet.annotations.ars-custom":          "ars-custom-value",
 			"resourceMeta.githubConfigSecret.annotations.gh-custom":             "gh-custom-value",
 			"resourceMeta.kubernetesModeRole.annotations.kmr-custom":            "kmr-custom-value",
@@ -2248,51 +2816,75 @@ func TestCustomAnnotations(t *testing.T) {
 			"resourceMeta.kubernetesModeServiceAccount.annotations.kmsa-custom": "kmsa-custom-value",
 			"resourceMeta.managerRole.annotations.mr-custom":                    "mr-custom-value",
 			"resourceMeta.managerRoleBinding.annotations.mrb-custom":            "mrb-custom-value",
+			"resourceMeta.autoscalingListener.annotations.al-custom":            "al-custom-value",
+			"resourceMeta.listenerServiceAccount.annotations.lsa-custom":        "lsa-custom-value",
+			"resourceMeta.listenerRole.annotations.lr-custom":                   "lr-custom-value",
+			"resourceMeta.listenerRoleBinding.annotations.lrb-custom":           "lrb-custom-value",
+			"resourceMeta.listenerConfigSecret.annotations.lcs-custom":          "lcs-custom-value",
+			"resourceMeta.ephemeralRunnerSet.annotations.ers-custom":            "ers-custom-value",
+			"resourceMeta.ephemeralRunner.annotations.er-custom":                "er-custom-value",
+			"resourceMeta.ephemeralRunnerConfigSecret.annotations.ercs-custom":  "ercs-custom-value",
 		},
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
 	const targetAnnotations = "argocd.argoproj.io/sync-wave"
-	const wantCustomValue = `"1"`
+	const wantCustomValue = "1"
 
-	output := helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/githubsecret.yaml"})
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/githubsecret.yaml"})
 
 	var githubSecret corev1.Secret
 	helm.UnmarshalK8SYaml(t, output, &githubSecret)
 	assert.Equal(t, wantCustomValue, githubSecret.Annotations[targetAnnotations])
 	assert.Equal(t, "gh-custom-value", githubSecret.Annotations["gh-custom"])
 
-	output = helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/kube_mode_role.yaml"})
+	output = helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/kube_mode_role.yaml"})
 	var role rbacv1.Role
 	helm.UnmarshalK8SYaml(t, output, &role)
 	assert.Equal(t, wantCustomValue, role.Annotations[targetAnnotations])
 	assert.Equal(t, "kmr-custom-value", role.Annotations["kmr-custom"])
 
-	output = helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/kube_mode_role_binding.yaml"})
+	output = helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/kube_mode_role_binding.yaml"})
 	var roleBinding rbacv1.RoleBinding
 	helm.UnmarshalK8SYaml(t, output, &roleBinding)
 	assert.Equal(t, wantCustomValue, roleBinding.Annotations[targetAnnotations])
 	assert.Equal(t, "kmrb-custom-value", roleBinding.Annotations["kmrb-custom"])
 
-	output = helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+	output = helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
 	var ars v1alpha1.AutoscalingRunnerSet
 	helm.UnmarshalK8SYaml(t, output, &ars)
 	assert.Equal(t, wantCustomValue, ars.Annotations[targetAnnotations])
 	assert.Equal(t, "ars-custom-value", ars.Annotations["ars-custom"])
+	require.NotNil(t, ars.Spec.AutoscalingListenerMetadata)
+	assert.Equal(t, "al-custom-value", ars.Spec.AutoscalingListenerMetadata.Annotations["al-custom"])
+	require.NotNil(t, ars.Spec.ListenerServiceAccountMetadata)
+	assert.Equal(t, "lsa-custom-value", ars.Spec.ListenerServiceAccountMetadata.Annotations["lsa-custom"])
+	require.NotNil(t, ars.Spec.ListenerRoleMetadata)
+	assert.Equal(t, "lr-custom-value", ars.Spec.ListenerRoleMetadata.Annotations["lr-custom"])
+	require.NotNil(t, ars.Spec.ListenerRoleBindingMetadata)
+	assert.Equal(t, "lrb-custom-value", ars.Spec.ListenerRoleBindingMetadata.Annotations["lrb-custom"])
+	require.NotNil(t, ars.Spec.ListenerConfigSecretMetadata)
+	assert.Equal(t, "lcs-custom-value", ars.Spec.ListenerConfigSecretMetadata.Annotations["lcs-custom"])
+	require.NotNil(t, ars.Spec.EphemeralRunnerSetMetadata)
+	assert.Equal(t, "ers-custom-value", ars.Spec.EphemeralRunnerSetMetadata.Annotations["ers-custom"])
+	require.NotNil(t, ars.Spec.EphemeralRunnerMetadata)
+	assert.Equal(t, "er-custom-value", ars.Spec.EphemeralRunnerMetadata.Annotations["er-custom"])
+	require.NotNil(t, ars.Spec.EphemeralRunnerConfigSecretMetadata)
+	assert.Equal(t, "ercs-custom-value", ars.Spec.EphemeralRunnerConfigSecretMetadata.Annotations["ercs-custom"])
 
-	output = helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/kube_mode_serviceaccount.yaml"})
+	output = helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/kube_mode_serviceaccount.yaml"})
 	var serviceAccount corev1.ServiceAccount
 	helm.UnmarshalK8SYaml(t, output, &serviceAccount)
 	assert.Equal(t, wantCustomValue, serviceAccount.Annotations[targetAnnotations])
 	assert.Equal(t, "kmsa-custom-value", serviceAccount.Annotations["kmsa-custom"])
 
-	output = helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/manager_role.yaml"})
+	output = helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/manager_role.yaml"})
 	var managerRole rbacv1.Role
 	helm.UnmarshalK8SYaml(t, output, &managerRole)
 	assert.Equal(t, wantCustomValue, managerRole.Annotations[targetAnnotations])
 	assert.Equal(t, "mr-custom-value", managerRole.Annotations["mr-custom"])
 
-	output = helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/manager_role_binding.yaml"})
+	output = helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/manager_role_binding.yaml"})
 	var managerRoleBinding rbacv1.RoleBinding
 	helm.UnmarshalK8SYaml(t, output, &managerRoleBinding)
 	assert.Equal(t, wantCustomValue, managerRoleBinding.Annotations[targetAnnotations])
@@ -2305,13 +2897,13 @@ func TestCustomAnnotations(t *testing.T) {
 			"githubConfigSecret.github_token":                                 "gh_token12345",
 			"controllerServiceAccount.name":                                   "arc",
 			"controllerServiceAccount.namespace":                              "arc-system",
-			`annotations.argocd\.argoproj\.io/sync-wave`:                      `"1"`,
+			`annotations.argocd\.argoproj\.io/sync-wave`:                      "1",
 			"resourceMeta.noPermissionServiceAccount.annotations.npsa-custom": "npsa-custom-value",
 		},
 		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
 	}
 
-	output = helm.RenderTemplate(t, options, helmChartPath, releaseName, []string{"templates/no_permission_serviceaccount.yaml"})
+	output = helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/no_permission_serviceaccount.yaml"})
 	var noPermissionServiceAccount corev1.ServiceAccount
 	helm.UnmarshalK8SYaml(t, output, &noPermissionServiceAccount)
 	assert.Equal(t, wantCustomValue, noPermissionServiceAccount.Annotations[targetAnnotations])
@@ -2324,8 +2916,8 @@ func TestNamespaceOverride(t *testing.T) {
 	chartPath := "../../gha-runner-scale-set"
 
 	releaseName := "test"
-	releaseNamespace := "test-" + strings.ToLower(random.UniqueId())
-	namespaceOverride := "test-" + strings.ToLower(random.UniqueId())
+	releaseNamespace := "test-" + strings.ToLower(random.UniqueID())
+	namespaceOverride := "test-" + strings.ToLower(random.UniqueID())
 
 	tt := map[string]struct {
 		file    string
@@ -2416,6 +3008,21 @@ func TestNamespaceOverride(t *testing.T) {
 				KubectlOptions: k8s.NewKubectlOptions("", "", releaseNamespace),
 			},
 		},
+		"kube_novolume_mode_role": {
+			file: "kube_mode_role.yaml",
+			options: &helm.Options{
+				Logger: logger.Discard,
+				SetValues: map[string]string{
+					"namespaceOverride":                  namespaceOverride,
+					"containerMode.type":                 "kubernetes-novolume",
+					"controllerServiceAccount.name":      "foo",
+					"controllerServiceAccount.namespace": "bar",
+					"githubConfigSecret.github_token":    "gh_token12345",
+					"githubConfigUrl":                    "https://github.com",
+				},
+				KubectlOptions: k8s.NewKubectlOptions("", "", releaseNamespace),
+			},
+		},
 		"kube_mode_role_binding": {
 			file: "kube_mode_role_binding.yaml",
 			options: &helm.Options{
@@ -2423,6 +3030,21 @@ func TestNamespaceOverride(t *testing.T) {
 				SetValues: map[string]string{
 					"namespaceOverride":                  namespaceOverride,
 					"containerMode.type":                 "kubernetes",
+					"controllerServiceAccount.name":      "foo",
+					"controllerServiceAccount.namespace": "bar",
+					"githubConfigSecret.github_token":    "gh_token12345",
+					"githubConfigUrl":                    "https://github.com",
+				},
+				KubectlOptions: k8s.NewKubectlOptions("", "", releaseNamespace),
+			},
+		},
+		"kube_novolume_mode_role_binding": {
+			file: "kube_mode_role_binding.yaml",
+			options: &helm.Options{
+				Logger: logger.Discard,
+				SetValues: map[string]string{
+					"namespaceOverride":                  namespaceOverride,
+					"containerMode.type":                 "kubernetes-novolume",
 					"controllerServiceAccount.name":      "foo",
 					"controllerServiceAccount.namespace": "bar",
 					"githubConfigSecret.github_token":    "gh_token12345",
@@ -2446,6 +3068,21 @@ func TestNamespaceOverride(t *testing.T) {
 				KubectlOptions: k8s.NewKubectlOptions("", "", releaseNamespace),
 			},
 		},
+		"kube_novolume_mode_serviceaccount": {
+			file: "kube_mode_serviceaccount.yaml",
+			options: &helm.Options{
+				Logger: logger.Discard,
+				SetValues: map[string]string{
+					"namespaceOverride":                  namespaceOverride,
+					"containerMode.type":                 "kubernetes-novolume",
+					"controllerServiceAccount.name":      "foo",
+					"controllerServiceAccount.namespace": "bar",
+					"githubConfigSecret.github_token":    "gh_token12345",
+					"githubConfigUrl":                    "https://github.com",
+				},
+				KubectlOptions: k8s.NewKubectlOptions("", "", releaseNamespace),
+			},
+		},
 	}
 
 	for name, tc := range tt {
@@ -2454,7 +3091,7 @@ func TestNamespaceOverride(t *testing.T) {
 			t.Parallel()
 			templateFile := filepath.Join("./templates", c.file)
 
-			output, err := helm.RenderTemplateE(t, c.options, chartPath, releaseName, []string{templateFile})
+			output, err := helm.RenderTemplateContextE(t, t.Context(), c.options, chartPath, releaseName, []string{templateFile})
 			if err != nil {
 				t.Errorf("Error rendering template %s from chart %s: %s", c.file, chartPath, err)
 			}
@@ -2465,6 +3102,487 @@ func TestNamespaceOverride(t *testing.T) {
 			var renderedObject object
 			helm.UnmarshalK8SYaml(t, output, &renderedObject)
 			assert.Equal(t, namespaceOverride, renderedObject.Metadata.Namespace)
+		})
+	}
+}
+
+func TestAutoscalingRunnerSetCustomAnnotationsAndLabelsApplied(t *testing.T) {
+	t.Parallel()
+
+	// Path to the helm chart we will test
+	helmChartPath, err := filepath.Abs("../../gha-runner-scale-set")
+	require.NoError(t, err)
+
+	releaseName := "test-runners"
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
+
+	options := &helm.Options{
+		Logger: logger.Discard,
+		SetValues: map[string]string{
+			"githubConfigUrl":                                              "https://github.com/actions",
+			"githubConfigSecret.github_token":                              "gh_token12345",
+			"controllerServiceAccount.name":                                "arc",
+			"controllerServiceAccount.namespace":                           "arc-system",
+			"annotations.actions\\.github\\.com/vault":                     "azure_key_vault",
+			"annotations.actions\\.github\\.com/cleanup-manager-role-name": "not-propagated",
+			"labels.custom":                                                "custom",
+			"labels.app\\.kubernetes\\.io/component":                       "not-propagated",
+		},
+		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
+	}
+
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+
+	var autoscalingRunnerSet v1alpha1.AutoscalingRunnerSet
+	helm.UnmarshalK8SYaml(t, output, &autoscalingRunnerSet)
+
+	vault := autoscalingRunnerSet.Annotations["actions.github.com/vault"]
+	assert.Equal(t, "azure_key_vault", vault)
+
+	custom := autoscalingRunnerSet.Labels["custom"]
+	assert.Equal(t, "custom", custom)
+
+	assert.NotEqual(t, "not-propagated", autoscalingRunnerSet.Annotations["actions.github.com/cleanup-manager-role-name"])
+	assert.NotEqual(t, "not-propagated", autoscalingRunnerSet.Labels["app.kubernetes.io/component"])
+}
+
+func TestTemplateRenderedAutoScalingRunnerSet_InvalidMetadataValidationError(t *testing.T) {
+	t.Parallel()
+
+	helmChartPath, err := filepath.Abs("../../gha-runner-scale-set")
+	require.NoError(t, err)
+
+	tt := map[string]struct {
+		key           string
+		value         string
+		expectedError string
+	}{
+		"runner pod label with smart quotes": {
+			key:           "template.metadata.labels.custom",
+			value:         "\u201ctrue\u201d",
+			expectedError: `.Values.template.metadata.labels: invalid value "“true”" for label "custom"`,
+		},
+		"runner pod label value too long": {
+			key:           "template.metadata.labels.custom",
+			value:         strings.Repeat("a", 64),
+			expectedError: `.Values.template.metadata.labels: invalid value "` + strings.Repeat("a", 64) + `" for label "custom": a label value must be no more than 63 characters`,
+		},
+		"runner pod label key with invalid prefix": {
+			key:           "template.metadata.labels.Invalid\\.Prefix/custom",
+			value:         "value",
+			expectedError: `.Values.template.metadata.labels: invalid label key "Invalid.Prefix/custom"`,
+		},
+		"runner pod annotation key invalid": {
+			key:           "template.metadata.annotations.invalid key",
+			value:         "value",
+			expectedError: `.Values.template.metadata.annotations: invalid annotation key "invalid key"`,
+		},
+		"chart level label invalid": {
+			key:           "labels.custom",
+			value:         "not valid",
+			expectedError: `.Values.labels: invalid value "not valid" for label "custom"`,
+		},
+		"resource meta label invalid": {
+			key:           "resourceMeta.ephemeralRunner.labels.custom",
+			value:         "not valid",
+			expectedError: `.Values.resourceMeta.ephemeralRunner.labels: invalid value "not valid" for label "custom"`,
+		},
+	}
+
+	for name, tc := range tt {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			releaseName := "test-runners"
+			namespaceName := "test-" + strings.ToLower(random.UniqueID())
+
+			options := &helm.Options{
+				Logger: logger.Discard,
+				SetValues: map[string]string{
+					"githubConfigUrl":                    "https://github.com/actions",
+					"githubConfigSecret.github_token":    "gh_token12345",
+					"controllerServiceAccount.name":      "arc",
+					"controllerServiceAccount.namespace": "arc-system",
+					tc.key:                               tc.value,
+				},
+				KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
+			}
+
+			_, err := helm.RenderTemplateContextE(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+			require.Error(t, err)
+			assert.ErrorContains(t, err, tc.expectedError)
+		})
+	}
+}
+
+func TestTemplateRenderedAutoScalingRunnerSet_ValidMetadataIsAccepted(t *testing.T) {
+	t.Parallel()
+
+	helmChartPath, err := filepath.Abs("../../gha-runner-scale-set")
+	require.NoError(t, err)
+
+	releaseName := "test-runners"
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
+
+	options := &helm.Options{
+		Logger: logger.Discard,
+		SetValues: map[string]string{
+			"githubConfigUrl":                                "https://github.com/actions",
+			"githubConfigSecret.github_token":                "gh_token12345",
+			"controllerServiceAccount.name":                  "arc",
+			"controllerServiceAccount.namespace":             "arc-system",
+			"template.metadata.labels.custom":                "true",
+			"template.metadata.labels.example\\.com/custom":  "value_1.0-rc",
+			"template.metadata.labels.empty":                 "",
+			"template.metadata.annotations.example\\.com/an": "any value is allowed: ✅",
+		},
+		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
+	}
+
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+
+	var autoscalingRunnerSet v1alpha1.AutoscalingRunnerSet
+	helm.UnmarshalK8SYaml(t, output, &autoscalingRunnerSet)
+
+	assert.Equal(t, "true", autoscalingRunnerSet.Spec.Template.Labels["custom"])
+	assert.Equal(t, "value_1.0-rc", autoscalingRunnerSet.Spec.Template.Labels["example.com/custom"])
+	assert.Equal(t, "", autoscalingRunnerSet.Spec.Template.Labels["empty"])
+	assert.Equal(t, "any value is allowed: ✅", autoscalingRunnerSet.Spec.Template.Annotations["example.com/an"])
+}
+
+// Kubernetes only accepts string label and annotation values. Values supplied as unquoted
+// YAML scalars parse as bools/numbers, so the chart has to coerce them when rendering.
+// A values file exercises float64 integers rather than the int64 values produced by --set.
+func TestTemplateRenderedAutoScalingRunnerSet_ScalarMetadataValuesAreRenderedAsStrings(t *testing.T) {
+	t.Parallel()
+
+	helmChartPath, err := filepath.Abs("../../gha-runner-scale-set")
+	require.NoError(t, err)
+
+	testValuesPath, err := filepath.Abs("../tests/values_scalar_metadata.yaml")
+	require.NoError(t, err)
+
+	releaseName := "test-runners"
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
+
+	options := &helm.Options{
+		Logger:         logger.Discard,
+		ValuesFiles:    []string{testValuesPath},
+		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
+	}
+
+	// UnmarshalK8SYaml fails outright if a value decodes as a bool or number rather than a
+	// string, so a successful decode is itself part of the assertion.
+	output := helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+
+	var autoscalingRunnerSet v1alpha1.AutoscalingRunnerSet
+	helm.UnmarshalK8SYaml(t, output, &autoscalingRunnerSet)
+
+	assert.Equal(t, "true", autoscalingRunnerSet.Labels["chart-bool"])
+	assert.Equal(t, "1", autoscalingRunnerSet.Labels["chart-int"])
+	assert.Equal(t, "9007199254740991", autoscalingRunnerSet.Labels["chart-max-safe-int"])
+	assert.Equal(t, "false", autoscalingRunnerSet.Annotations["chart-bool-annotation"])
+	assert.Equal(t, "1.5", autoscalingRunnerSet.Annotations["chart-float-annotation"])
+	assert.Equal(t, "12345678901234", autoscalingRunnerSet.Annotations["chart-big-int-annotation"])
+	assert.Equal(t, "9007199254740991", autoscalingRunnerSet.Annotations["chart-max-safe-int-annotation"])
+	assert.Equal(t, "-9007199254740991", autoscalingRunnerSet.Annotations["chart-min-safe-int-annotation"])
+	assert.Equal(t, "9007199254740993", autoscalingRunnerSet.Annotations["chart-quoted-unsafe-int-annotation"])
+
+	assert.Equal(t, "true", autoscalingRunnerSet.Spec.Template.Labels["pod-bool"])
+	assert.Equal(t, "42", autoscalingRunnerSet.Spec.Template.Labels["pod-int"])
+	assert.Equal(t, "true", autoscalingRunnerSet.Spec.Template.Annotations["pod-bool-annotation"])
+	assert.Equal(t, "7", autoscalingRunnerSet.Spec.Template.Annotations["pod-int-annotation"])
+
+	require.NotNil(t, autoscalingRunnerSet.Spec.ListenerTemplate)
+	assert.Equal(t, "true", autoscalingRunnerSet.Spec.ListenerTemplate.Labels["listener-bool"])
+	assert.Equal(t, "11", autoscalingRunnerSet.Spec.ListenerTemplate.Annotations["listener-int-annotation"])
+	require.Len(t, autoscalingRunnerSet.Spec.ListenerTemplate.Spec.Containers, 1)
+	assert.Equal(t, "listener", autoscalingRunnerSet.Spec.ListenerTemplate.Spec.Containers[0].Name)
+
+	require.NotNil(t, autoscalingRunnerSet.Spec.EphemeralRunnerMetadata)
+	assert.Equal(t, "false", autoscalingRunnerSet.Spec.EphemeralRunnerMetadata.Labels["runner-bool"])
+	assert.Equal(t, "3", autoscalingRunnerSet.Spec.EphemeralRunnerMetadata.Labels["runner-int"])
+	assert.Equal(t, "9", autoscalingRunnerSet.Spec.EphemeralRunnerMetadata.Annotations["runner-int-annotation"])
+
+	output = helm.RenderTemplateContext(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/githubsecret.yaml"})
+
+	var githubSecret corev1.Secret
+	helm.UnmarshalK8SYaml(t, output, &githubSecret)
+
+	assert.Equal(t, "5", githubSecret.Labels["secret-int"])
+	assert.Equal(t, "true", githubSecret.Labels["chart-bool"])
+	assert.Equal(t, "1.5", githubSecret.Annotations["chart-float-annotation"])
+}
+
+func TestTemplateRenderedAutoScalingRunnerSet_UnsafeIntegerMetadataValueValidationError(t *testing.T) {
+	t.Parallel()
+
+	helmChartPath, err := filepath.Abs("../../gha-runner-scale-set")
+	require.NoError(t, err)
+
+	testValuesPath, err := filepath.Abs("../tests/values_unsafe_metadata.yaml")
+	require.NoError(t, err)
+
+	options := &helm.Options{
+		Logger:         logger.Discard,
+		ValuesFiles:    []string{testValuesPath},
+		KubectlOptions: k8s.NewKubectlOptions("", "", "test"),
+	}
+
+	_, err = helm.RenderTemplateContextE(t, t.Context(), options, helmChartPath, "test-runners", []string{"templates/autoscalingrunnerset.yaml"})
+	require.Error(t, err)
+	assert.ErrorContains(t, err, `.Values.annotations: invalid value for annotation "unsafe-integer": unquoted integers outside the IEEE 754 safe range must be quoted to preserve their exact value`)
+}
+
+func TestTemplateRenderedAutoScalingRunnerSet_IntegerMetadataBoundariesFromSet(t *testing.T) {
+	t.Parallel()
+
+	charts := map[string]struct {
+		urlKey         string
+		tokenKey       string
+		annotationPath string
+		templateFile   string
+	}{
+		"gha-runner-scale-set": {
+			urlKey:         "githubConfigUrl",
+			tokenKey:       "githubConfigSecret.github_token",
+			annotationPath: "annotations",
+			templateFile:   "templates/autoscalingrunnerset.yaml",
+		},
+		"gha-runner-scale-set-experimental": {
+			urlKey:         "auth.url",
+			tokenKey:       "auth.githubToken",
+			annotationPath: "resource.all.metadata.annotations",
+			templateFile:   "templates/autoscalingrunnserset.yaml",
+		},
+	}
+
+	tt := map[string]struct {
+		value   string
+		invalid bool
+	}{
+		"maximum safe integer":            {value: "9007199254740991"},
+		"minimum safe integer":            {value: "-9007199254740991"},
+		"first unsafe positive integer":   {value: "9007199254740992", invalid: true},
+		"first unsafe negative integer":   {value: "-9007199254740992", invalid: true},
+		"rounded unsafe positive integer": {value: "9007199254740993", invalid: true},
+		"rounded unsafe negative integer": {value: "-9007199254740993", invalid: true},
+	}
+
+	// helm-unittest's set values are float64, so exercise --set's int64 path in both charts.
+	for chart, config := range charts {
+		t.Run(chart, func(t *testing.T) {
+			t.Parallel()
+
+			helmChartPath, err := filepath.Abs("../../" + chart)
+			require.NoError(t, err)
+
+			for name, tc := range tt {
+				t.Run(name, func(t *testing.T) {
+					t.Parallel()
+
+					options := &helm.Options{
+						Logger: logger.Discard,
+						SetValues: map[string]string{
+							config.urlKey:                               "https://github.com/actions",
+							config.tokenKey:                             "gh_token12345",
+							"controllerServiceAccount.name":             "arc",
+							"controllerServiceAccount.namespace":        "arc-system",
+							config.annotationPath + ".integer-boundary": tc.value,
+						},
+						KubectlOptions: k8s.NewKubectlOptions("", "", "test"),
+					}
+
+					output, err := helm.RenderTemplateContextE(t, t.Context(), options, helmChartPath, "test-runners", []string{config.templateFile})
+					if tc.invalid {
+						require.Error(t, err)
+						assert.ErrorContains(t, err, ".Values."+config.annotationPath+`: invalid value for annotation "integer-boundary": unquoted integers outside the IEEE 754 safe range must be quoted to preserve their exact value`)
+						return
+					}
+					require.NoError(t, err)
+
+					var autoscalingRunnerSet v1alpha1.AutoscalingRunnerSet
+					helm.UnmarshalK8SYaml(t, output, &autoscalingRunnerSet)
+					assert.Equal(t, tc.value, autoscalingRunnerSet.Annotations["integer-boundary"])
+				})
+			}
+		})
+	}
+}
+
+func TestTemplateRenderedAutoScalingRunnerSet_OverlongMetadataPrefixSegmentValidationError(t *testing.T) {
+	t.Parallel()
+
+	helmChartPath, err := filepath.Abs("../../gha-runner-scale-set")
+	require.NoError(t, err)
+
+	testValuesPath, err := filepath.Abs("../tests/values_overlong_metadata_prefix.yaml")
+	require.NoError(t, err)
+
+	options := &helm.Options{
+		Logger:         logger.Discard,
+		ValuesFiles:    []string{testValuesPath},
+		KubectlOptions: k8s.NewKubectlOptions("", "", "test"),
+	}
+
+	_, err = helm.RenderTemplateContextE(t, t.Context(), options, helmChartPath, "test-runners", []string{"templates/autoscalingrunnerset.yaml"})
+	require.Error(t, err)
+	assert.ErrorContains(t, err, `.Values.annotations: invalid annotation key "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.example.com/overlong-prefix": the prefix segment "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" must be no more than 63 characters`)
+}
+
+func TestTemplateRenderedAutoScalingRunnerSet_NonMapMetadataValidationError(t *testing.T) {
+	t.Parallel()
+
+	helmChartPath, err := filepath.Abs("../../gha-runner-scale-set")
+	require.NoError(t, err)
+
+	tt := map[string]struct {
+		key           string
+		value         string
+		expectedError string
+	}{
+		"chart labels is not a map": {
+			key:           "labels",
+			value:         "oops",
+			expectedError: ".Values.labels: must be a mapping, got string",
+		},
+		"runner pod labels is not a map": {
+			key:           "template.metadata.labels",
+			value:         "oops",
+			expectedError: ".Values.template.metadata.labels: must be a mapping, got string",
+		},
+		"resourceMeta entry is not a map": {
+			key:           "resourceMeta.githubConfigSecret",
+			value:         "oops",
+			expectedError: ".Values.resourceMeta.githubConfigSecret: must be a mapping, got string",
+		},
+		"listener metadata is not a map": {
+			key:           "listenerTemplate.metadata",
+			value:         "oops",
+			expectedError: ".Values.listenerTemplate.metadata: must be a mapping, got string",
+		},
+	}
+
+	for name, tc := range tt {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			releaseName := "test-runners"
+			namespaceName := "test-" + strings.ToLower(random.UniqueID())
+
+			options := &helm.Options{
+				Logger: logger.Discard,
+				SetValues: map[string]string{
+					"githubConfigUrl":                    "https://github.com/actions",
+					"githubConfigSecret.github_token":    "gh_token12345",
+					"controllerServiceAccount.name":      "arc",
+					"controllerServiceAccount.namespace": "arc-system",
+					tc.key:                               tc.value,
+				},
+				KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
+			}
+
+			_, err := helm.RenderTemplateContextE(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+			require.Error(t, err)
+			assert.ErrorContains(t, err, tc.expectedError)
+		})
+	}
+}
+
+func TestTemplateRenderedAutoScalingRunnerSet_ListenerMetadataIsValidated(t *testing.T) {
+	t.Parallel()
+
+	helmChartPath, err := filepath.Abs("../../gha-runner-scale-set")
+	require.NoError(t, err)
+
+	releaseName := "test-runners"
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
+
+	options := &helm.Options{
+		Logger: logger.Discard,
+		SetValues: map[string]string{
+			"githubConfigUrl":                          "https://github.com/actions",
+			"githubConfigSecret.github_token":          "gh_token12345",
+			"controllerServiceAccount.name":            "arc",
+			"controllerServiceAccount.namespace":       "arc-system",
+			"listenerTemplate.metadata.labels.purpose": "“true”",
+			"listenerTemplate.spec.containers[0].name": "listener",
+		},
+		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
+	}
+
+	_, err = helm.RenderTemplateContextE(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `.Values.listenerTemplate.metadata.labels: invalid value "“true”" for label "purpose"`)
+}
+
+func TestTemplateRenderedAutoScalingRunnerSet_NonScalarMetadataValueValidationError(t *testing.T) {
+	t.Parallel()
+
+	helmChartPath, err := filepath.Abs("../../gha-runner-scale-set")
+	require.NoError(t, err)
+
+	releaseName := "test-runners"
+	namespaceName := "test-" + strings.ToLower(random.UniqueID())
+
+	options := &helm.Options{
+		Logger: logger.Discard,
+		SetValues: map[string]string{
+			"githubConfigUrl":                    "https://github.com/actions",
+			"githubConfigSecret.github_token":    "gh_token12345",
+			"controllerServiceAccount.name":      "arc",
+			"controllerServiceAccount.namespace": "arc-system",
+		},
+		SetJSONValues: map[string]string{
+			"template.metadata.annotations": `{"nested":{"inner":"value"}}`,
+		},
+		KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
+	}
+
+	_, err = helm.RenderTemplateContextE(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `.Values.template.metadata.annotations: invalid value for annotation "nested": must be a scalar, got map`)
+}
+
+func TestTemplateRenderedAutoScalingRunnerSet_MetadataPrefixSegmentLengthBoundary(t *testing.T) {
+	t.Parallel()
+
+	helmChartPath, err := filepath.Abs("../../gha-runner-scale-set")
+	require.NoError(t, err)
+
+	for _, length := range []int{63, 64} {
+		t.Run(fmt.Sprintf("%d characters", length), func(t *testing.T) {
+			t.Parallel()
+
+			releaseName := "test-runners"
+			namespaceName := "test-" + strings.ToLower(random.UniqueID())
+
+			segment := strings.Repeat("a", length)
+			key := segment + ".example.com/purpose"
+
+			options := &helm.Options{
+				Logger: logger.Discard,
+				SetValues: map[string]string{
+					"githubConfigUrl":                                                "https://github.com/actions",
+					"githubConfigSecret.github_token":                                "gh_token12345",
+					"controllerServiceAccount.name":                                  "arc",
+					"controllerServiceAccount.namespace":                             "arc-system",
+					"template.metadata.labels." + strings.ReplaceAll(key, ".", `\.`): "yes",
+				},
+				KubectlOptions: k8s.NewKubectlOptions("", "", namespaceName),
+			}
+
+			output, err := helm.RenderTemplateContextE(t, t.Context(), options, helmChartPath, releaseName, []string{"templates/autoscalingrunnerset.yaml"})
+			if length == 64 {
+				require.Error(t, err)
+				assert.ErrorContains(t, err, `.Values.template.metadata.labels: invalid label key "`+key+`": the prefix segment "`+segment+`" must be no more than 63 characters`)
+				return
+			}
+			require.NoError(t, err)
+
+			var autoscalingRunnerSet v1alpha1.AutoscalingRunnerSet
+			helm.UnmarshalK8SYaml(t, output, &autoscalingRunnerSet)
+			assert.Equal(t, "yes", autoscalingRunnerSet.Spec.Template.Labels[key])
 		})
 	}
 }

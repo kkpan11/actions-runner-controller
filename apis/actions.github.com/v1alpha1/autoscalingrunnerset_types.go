@@ -23,7 +23,7 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/actions/actions-runner-controller/hash"
+	"github.com/actions/actions-runner-controller/vault"
 	"golang.org/x/net/http/httpproxy"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -35,28 +35,26 @@ import (
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:JSONPath=".spec.minRunners",name=Minimum Runners,type=integer
 // +kubebuilder:printcolumn:JSONPath=".spec.maxRunners",name=Maximum Runners,type=integer
-// +kubebuilder:printcolumn:JSONPath=".status.currentRunners",name=Current Runners,type=integer
-// +kubebuilder:printcolumn:JSONPath=".status.state",name=State,type=string
-// +kubebuilder:printcolumn:JSONPath=".status.pendingEphemeralRunners",name=Pending Runners,type=integer
-// +kubebuilder:printcolumn:JSONPath=".status.runningEphemeralRunners",name=Running Runners,type=integer
-// +kubebuilder:printcolumn:JSONPath=".status.finishedEphemeralRunners",name=Finished Runners,type=integer
-// +kubebuilder:printcolumn:JSONPath=".status.deletingEphemeralRunners",name=Deleting Runners,type=integer
+// +kubebuilder:printcolumn:JSONPath=".status.phase",name=Phase,type=string
 
 // AutoscalingRunnerSet is the Schema for the autoscalingrunnersets API
 type AutoscalingRunnerSet struct {
-	metav1.TypeMeta   `json:",inline"`
+	metav1.TypeMeta `json:",inline"`
+	// +optional
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   AutoscalingRunnerSetSpec   `json:"spec,omitempty"`
+	// +optional
+	Spec AutoscalingRunnerSetSpec `json:"spec,omitempty"`
+	// +optional
 	Status AutoscalingRunnerSetStatus `json:"status,omitempty"`
 }
 
 // AutoscalingRunnerSetSpec defines the desired state of AutoscalingRunnerSet
 type AutoscalingRunnerSetSpec struct {
-	// Required
+	// +optional
 	GitHubConfigUrl string `json:"githubConfigUrl,omitempty"`
 
-	// Required
+	// +optional
 	GitHubConfigSecret string `json:"githubConfigSecret,omitempty"`
 
 	// +optional
@@ -66,13 +64,22 @@ type AutoscalingRunnerSetSpec struct {
 	RunnerScaleSetName string `json:"runnerScaleSetName,omitempty"`
 
 	// +optional
+	RunnerScaleSetLabels []string `json:"runnerScaleSetLabels,omitempty"`
+
+	// +optional
 	Proxy *ProxyConfig `json:"proxy,omitempty"`
 
 	// +optional
-	GitHubServerTLS *GitHubServerTLSConfig `json:"githubServerTLS,omitempty"`
+	GitHubServerTLS *TLSConfig `json:"githubServerTLS,omitempty"`
 
-	// Required
+	// +optional
+	VaultConfig *VaultConfig `json:"vaultConfig,omitempty"`
+
+	// +optional
 	Template corev1.PodTemplateSpec `json:"template,omitempty"`
+
+	// +optional
+	AutoscalingListenerMetadata *ResourceMeta `json:"autoscalingListener,omitempty"`
 
 	// +optional
 	ListenerMetrics *MetricsConfig `json:"listenerMetrics,omitempty"`
@@ -81,20 +88,44 @@ type AutoscalingRunnerSetSpec struct {
 	ListenerTemplate *corev1.PodTemplateSpec `json:"listenerTemplate,omitempty"`
 
 	// +optional
+	ListenerServiceAccountMetadata *ResourceMeta `json:"listenerServiceAccountMetadata,omitempty"`
+
+	// +optional
+	ListenerRoleMetadata *ResourceMeta `json:"listenerRoleMetadata,omitempty"`
+
+	// +optional
+	ListenerRoleBindingMetadata *ResourceMeta `json:"listenerRoleBindingMetadata,omitempty"`
+
+	// +optional
+	ListenerConfigSecretMetadata *ResourceMeta `json:"listenerConfigSecretMetadata,omitempty"`
+
+	// +optional
+	EphemeralRunnerSetMetadata *ResourceMeta `json:"ephemeralRunnerSetMetadata,omitempty"`
+
+	// +optional
+	EphemeralRunnerMetadata *ResourceMeta `json:"ephemeralRunnerMetadata,omitempty"`
+
+	// +optional
+	EphemeralRunnerConfigSecretMetadata *ResourceMeta `json:"ephemeralRunnerConfigSecretMetadata,omitempty"`
+
+	// +optional
 	// +kubebuilder:validation:Minimum:=0
 	MaxRunners *int `json:"maxRunners,omitempty"`
 
 	// +optional
 	// +kubebuilder:validation:Minimum:=0
 	MinRunners *int `json:"minRunners,omitempty"`
+
+	// +optional
+	ListenerConfig *ListenerConfig `json:"listenerConfig,omitempty"`
 }
 
-type GitHubServerTLSConfig struct {
+type TLSConfig struct {
 	// Required
 	CertificateFrom *TLSCertificateSource `json:"certificateFrom,omitempty"`
 }
 
-func (c *GitHubServerTLSConfig) ToCertPool(keyFetcher func(name, key string) ([]byte, error)) (*x509.CertPool, error) {
+func (c *TLSConfig) ToCertPool(keyFetcher func(name, key string) ([]byte, error)) (*x509.CertPool, error) {
 	if c.CertificateFrom == nil {
 		return nil, fmt.Errorf("certificateFrom not specified")
 	}
@@ -142,7 +173,7 @@ type ProxyConfig struct {
 	NoProxy []string `json:"noProxy,omitempty"`
 }
 
-func (c *ProxyConfig) toHTTPProxyConfig(secretFetcher func(string) (*corev1.Secret, error)) (*httpproxy.Config, error) {
+func (c *ProxyConfig) ToHTTPProxyConfig(secretFetcher func(string) (*corev1.Secret, error)) (*httpproxy.Config, error) {
 	config := &httpproxy.Config{
 		NoProxy: strings.Join(c.NoProxy, ","),
 	}
@@ -201,7 +232,7 @@ func (c *ProxyConfig) toHTTPProxyConfig(secretFetcher func(string) (*corev1.Secr
 }
 
 func (c *ProxyConfig) ToSecretData(secretFetcher func(string) (*corev1.Secret, error)) (map[string][]byte, error) {
-	config, err := c.toHTTPProxyConfig(secretFetcher)
+	config, err := c.ToHTTPProxyConfig(secretFetcher)
 	if err != nil {
 		return nil, err
 	}
@@ -215,7 +246,7 @@ func (c *ProxyConfig) ToSecretData(secretFetcher func(string) (*corev1.Secret, e
 }
 
 func (c *ProxyConfig) ProxyFunc(secretFetcher func(string) (*corev1.Secret, error)) (func(*http.Request) (*url.URL, error), error) {
-	config, err := c.toHTTPProxyConfig(secretFetcher)
+	config, err := c.ToHTTPProxyConfig(secretFetcher)
 	if err != nil {
 		return nil, err
 	}
@@ -233,6 +264,26 @@ type ProxyServerConfig struct {
 
 	// +optional
 	CredentialSecretRef string `json:"credentialSecretRef,omitempty"`
+}
+
+type VaultConfig struct {
+	// +optional
+	Type vault.VaultType `json:"type,omitempty"`
+	// +optional
+	AzureKeyVault *AzureKeyVaultConfig `json:"azureKeyVault,omitempty"`
+	// +optional
+	Proxy *ProxyConfig `json:"proxy,omitempty"`
+}
+
+type AzureKeyVaultConfig struct {
+	// +required
+	URL string `json:"url,omitempty"`
+	// +required
+	TenantID string `json:"tenantId,omitempty"`
+	// +required
+	ClientID string `json:"clientId,omitempty"`
+	// +required
+	CertificatePath string `json:"certificatePath,omitempty"`
 }
 
 // MetricsConfig holds configuration parameters for each metric type
@@ -264,47 +315,48 @@ type HistogramMetric struct {
 // AutoscalingRunnerSetStatus defines the observed state of AutoscalingRunnerSet
 type AutoscalingRunnerSetStatus struct {
 	// +optional
-	CurrentRunners int `json:"currentRunners"`
-
+	Phase AutoscalingRunnerSetPhase `json:"phase"`
+	// ObservedGeneration tracks the metadata.generation of this ARS at observation time,
+	// enabling detection of Pending phase when generation differs. Unset defaults to 0.
 	// +optional
-	State string `json:"state"`
-
-	// EphemeralRunner counts separated by the stage ephemeral runners are in, taken from the EphemeralRunnerSet
-
-	// +optional
-	PendingEphemeralRunners int `json:"pendingEphemeralRunners"`
-	// +optional
-	RunningEphemeralRunners int `json:"runningEphemeralRunners"`
-	// +optional
-	FailedEphemeralRunners int `json:"failedEphemeralRunners"`
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 }
 
-func (ars *AutoscalingRunnerSet) ListenerSpecHash() string {
-	arsSpec := ars.Spec.DeepCopy()
-	spec := arsSpec
-	return hash.ComputeTemplateHash(&spec)
+type AutoscalingRunnerSetPhase string
+
+const (
+	// AutoscalingRunnerSetPhasePending phase means that the listener is not
+	// yet started
+	AutoscalingRunnerSetPhasePending  AutoscalingRunnerSetPhase = "Pending"
+	AutoscalingRunnerSetPhaseRunning  AutoscalingRunnerSetPhase = "Running"
+	AutoscalingRunnerSetPhaseOutdated AutoscalingRunnerSetPhase = "Outdated"
+)
+
+func (ars *AutoscalingRunnerSet) GitHubConfigSecret() string {
+	return ars.Spec.GitHubConfigSecret
 }
 
-func (ars *AutoscalingRunnerSet) RunnerSetSpecHash() string {
-	type runnerSetSpec struct {
-		GitHubConfigUrl    string
-		GitHubConfigSecret string
-		RunnerGroup        string
-		RunnerScaleSetName string
-		Proxy              *ProxyConfig
-		GitHubServerTLS    *GitHubServerTLSConfig
-		Template           corev1.PodTemplateSpec
+func (ars *AutoscalingRunnerSet) GitHubConfigUrl() string {
+	return ars.Spec.GitHubConfigUrl
+}
+
+func (ars *AutoscalingRunnerSet) GitHubProxy() *ProxyConfig {
+	return ars.Spec.Proxy
+}
+
+func (ars *AutoscalingRunnerSet) GitHubServerTLS() *TLSConfig {
+	return ars.Spec.GitHubServerTLS
+}
+
+func (ars *AutoscalingRunnerSet) VaultConfig() *VaultConfig {
+	return ars.Spec.VaultConfig
+}
+
+func (ars *AutoscalingRunnerSet) VaultProxy() *ProxyConfig {
+	if ars.Spec.VaultConfig != nil {
+		return ars.Spec.VaultConfig.Proxy
 	}
-	spec := &runnerSetSpec{
-		GitHubConfigUrl:    ars.Spec.GitHubConfigUrl,
-		GitHubConfigSecret: ars.Spec.GitHubConfigSecret,
-		RunnerGroup:        ars.Spec.RunnerGroup,
-		RunnerScaleSetName: ars.Spec.RunnerScaleSetName,
-		Proxy:              ars.Spec.Proxy,
-		GitHubServerTLS:    ars.Spec.GitHubServerTLS,
-		Template:           ars.Spec.Template,
-	}
-	return hash.ComputeTemplateHash(&spec)
+	return nil
 }
 
 // +kubebuilder:object:root=true
@@ -314,8 +366,4 @@ type AutoscalingRunnerSetList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []AutoscalingRunnerSet `json:"items"`
-}
-
-func init() {
-	SchemeBuilder.Register(&AutoscalingRunnerSet{}, &AutoscalingRunnerSetList{})
 }

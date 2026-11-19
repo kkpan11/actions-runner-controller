@@ -1,161 +1,55 @@
 package config_test
 
 import (
-	"context"
-	"crypto/tls"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
+	"sync/atomic"
 	"testing"
 
+	"github.com/actions/actions-runner-controller/apis/actions.github.com/v1alpha1/appconfig"
 	"github.com/actions/actions-runner-controller/cmd/ghalistener/config"
-	"github.com/actions/actions-runner-controller/github/actions"
-	"github.com/actions/actions-runner-controller/github/actions/testserver"
-	"github.com/go-logr/logr"
-	"github.com/stretchr/testify/assert"
+	"github.com/actions/scaleset"
 	"github.com/stretchr/testify/require"
 )
 
-func TestCustomerServerRootCA(t *testing.T) {
-	ctx := context.Background()
-	certsFolder := filepath.Join(
-		"../../../",
-		"github",
-		"actions",
-		"testdata",
-	)
-	certPath := filepath.Join(certsFolder, "server.crt")
-	keyPath := filepath.Join(certsFolder, "server.key")
-
-	serverCalledSuccessfully := false
-
-	server := testserver.NewUnstarted(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		serverCalledSuccessfully = true
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"count": 0}`))
-	}))
-	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
-	require.NoError(t, err)
-
-	server.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
-	server.StartTLS()
-
-	var certsString string
-	rootCA, err := os.ReadFile(filepath.Join(certsFolder, "rootCA.crt"))
-	require.NoError(t, err)
-	certsString = string(rootCA)
-
-	intermediate, err := os.ReadFile(filepath.Join(certsFolder, "intermediate.crt"))
-	require.NoError(t, err)
-	certsString = certsString + string(intermediate)
-
-	config := config.Config{
-		ConfigureUrl: server.ConfigURLForOrg("myorg"),
-		ServerRootCA: certsString,
-		Token:        "token",
-	}
-
-	client, err := config.ActionsClient(logr.Discard())
-	require.NoError(t, err)
-	_, err = client.GetRunnerScaleSet(ctx, 1, "test")
-	require.NoError(t, err)
-	assert.True(t, serverCalledSuccessfully)
-}
+var discardLogger = slog.New(slog.DiscardHandler)
 
 func TestProxySettings(t *testing.T) {
-	t.Run("http", func(t *testing.T) {
-		wentThroughProxy := false
+	for _, tc := range []struct {
+		name   string
+		scheme string
+		env    string
+	}{
+		{name: "http", scheme: "http", env: "http_proxy"},
+		{name: "https", scheme: "https", env: "https_proxy"},
+		{name: "no_proxy", scheme: "https", env: "https_proxy"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, env := range []string{"http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "no_proxy", "NO_PROXY"} {
+				t.Setenv(env, "")
+			}
+			var requests atomic.Int32
+			proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				w.WriteHeader(http.StatusBadGateway)
+			}))
+			defer proxy.Close()
+			t.Setenv(tc.env, proxy.URL)
+			if tc.name == "no_proxy" {
+				t.Setenv("no_proxy", "example.com")
+			}
 
-		proxy := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-			wentThroughProxy = true
-		}))
-		t.Cleanup(func() {
-			proxy.Close()
+			config := config.Config{
+				ConfigureURL: tc.scheme + "://github.com/org/repo",
+				AppConfig:    &appconfig.AppConfig{Token: "token"},
+			}
+			client, err := config.ActionsClient(discardLogger, scaleset.WithRetry(scaleset.RetryConfig{Max: 0}))
+			require.NoError(t, err)
+
+			_, err = client.GenerateJitRunnerConfig(t.Context(), &scaleset.RunnerScaleSetJitRunnerSetting{Name: "runner"}, 1)
+			require.Error(t, err)
+			require.EqualValues(t, 1, requests.Load(), "the request must use the configured proxy")
 		})
-
-		prevProxy := os.Getenv("http_proxy")
-		os.Setenv("http_proxy", proxy.URL)
-		defer os.Setenv("http_proxy", prevProxy)
-
-		config := config.Config{
-			ConfigureUrl: "https://github.com/org/repo",
-			Token:        "token",
-		}
-
-		client, err := config.ActionsClient(logr.Discard())
-		require.NoError(t, err)
-
-		req, err := http.NewRequest(http.MethodGet, "http://example.com", nil)
-		require.NoError(t, err)
-		_, err = client.Do(req)
-		require.NoError(t, err)
-
-		assert.True(t, wentThroughProxy)
-	})
-
-	t.Run("https", func(t *testing.T) {
-		wentThroughProxy := false
-
-		proxy := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-			wentThroughProxy = true
-		}))
-		t.Cleanup(func() {
-			proxy.Close()
-		})
-
-		prevProxy := os.Getenv("https_proxy")
-		os.Setenv("https_proxy", proxy.URL)
-		defer os.Setenv("https_proxy", prevProxy)
-
-		config := config.Config{
-			ConfigureUrl: "https://github.com/org/repo",
-			Token:        "token",
-		}
-
-		client, err := config.ActionsClient(logr.Discard(), actions.WithRetryMax(0))
-		require.NoError(t, err)
-
-		req, err := http.NewRequest(http.MethodGet, "https://example.com", nil)
-		require.NoError(t, err)
-
-		_, err = client.Do(req)
-		// proxy doesn't support https
-		assert.Error(t, err)
-		assert.True(t, wentThroughProxy)
-	})
-
-	t.Run("no_proxy", func(t *testing.T) {
-		wentThroughProxy := false
-
-		proxy := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-			wentThroughProxy = true
-		}))
-		t.Cleanup(func() {
-			proxy.Close()
-		})
-
-		prevProxy := os.Getenv("http_proxy")
-		os.Setenv("http_proxy", proxy.URL)
-		defer os.Setenv("http_proxy", prevProxy)
-
-		prevNoProxy := os.Getenv("no_proxy")
-		os.Setenv("no_proxy", "example.com")
-		defer os.Setenv("no_proxy", prevNoProxy)
-
-		config := config.Config{
-			ConfigureUrl: "https://github.com/org/repo",
-			Token:        "token",
-		}
-
-		client, err := config.ActionsClient(logr.Discard())
-		require.NoError(t, err)
-
-		req, err := http.NewRequest(http.MethodGet, "http://example.com", nil)
-		require.NoError(t, err)
-
-		_, err = client.Do(req)
-		require.NoError(t, err)
-		assert.False(t, wentThroughProxy)
-	})
+	}
 }
