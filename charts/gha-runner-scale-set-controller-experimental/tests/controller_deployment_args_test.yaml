@@ -1,0 +1,152 @@
+suite: "Controller Deployment args"
+templates:
+  - deployment.yaml
+tests:
+  - it: should include metrics-disabled flags by default
+    release:
+      name: "test-arc"
+      namespace: "test-ns"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "--metrics-addr=0"
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "--listener-metrics-addr=0"
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "--listener-metrics-endpoint="
+
+  - it: should include watch-single-namespace flag when configured
+    set:
+      controller:
+        manager:
+          config:
+            watchSingleNamespace: "demo"
+    release:
+      name: "test-arc"
+      namespace: "test-ns"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "--watch-single-namespace=demo"
+
+  - it: should include exclude-label-propagation-prefix flags when configured
+    set:
+      controller:
+        manager:
+          config:
+            excludeLabelPropagationPrefixes:
+              - "prefix.com/"
+              - "complete.io/label"
+    release:
+      name: "test-arc"
+      namespace: "test-ns"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "--exclude-label-propagation-prefix=prefix.com/"
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "--exclude-label-propagation-prefix=complete.io/label"
+
+  - it: should render metrics port when metrics are enabled
+    set:
+      controller:
+        metrics:
+          controllerManagerAddr: ":8080"
+          listenerAddr: ":8081"
+          listenerEndpoint: "/metrics"
+    release:
+      name: "test-arc"
+      namespace: "test-ns"
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].ports[0].containerPort
+          value: 8080
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "--metrics-addr=:8080"
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "--listener-metrics-addr=:8081"
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "--listener-metrics-endpoint=/metrics"
+
+  - it: should render every max-concurrent-reconciles flag by default
+    release:
+      name: "test-arc"
+      namespace: "test-ns"
+    asserts:
+      # An exact match, so this pins both the values and the render order.
+      - equal:
+          path: spec.template.spec.containers[0].args
+          value:
+            - "--auto-scaling-runner-set-only"
+            - "--log-level=debug"
+            - "--log-format=text"
+            - "--autoscaling-runner-set-max-concurrent-reconciles=2"
+            - "--autoscaling-listener-max-concurrent-reconciles=2"
+            - "--ephemeral-runner-set-max-concurrent-reconciles=2"
+            - "--ephemeral-runner-max-concurrent-reconciles=4"
+            - "--listener-metrics-addr=0"
+            - "--listener-metrics-endpoint="
+            - "--metrics-addr=0"
+
+  - it: should include every max-concurrent-reconciles flag when configured
+    set:
+      controller:
+        manager:
+          config:
+            autoscalingRunnerSetMaxConcurrentReconciles: 3
+            autoscalingListenerMaxConcurrentReconciles: 5
+            ephemeralRunnerSetMaxConcurrentReconciles: 6
+            ephemeralRunnerMaxConcurrentReconciles: 20
+    release:
+      name: "test-arc"
+      namespace: "test-ns"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "--autoscaling-runner-set-max-concurrent-reconciles=3"
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "--autoscaling-listener-max-concurrent-reconciles=5"
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "--ephemeral-runner-set-max-concurrent-reconciles=6"
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "--ephemeral-runner-max-concurrent-reconciles=20"
+
+  # Unset, the controller keeps its own default of removing a finished runner pod
+  # immediately. The exact match above is what pins that no flag is rendered for it.
+  - it: should render the terminated runner pod grace period when configured
+    set:
+      controller:
+        manager:
+          config:
+            terminatedRunnerPodGracePeriodSeconds: 30
+    release:
+      name: "test-arc"
+      namespace: "test-ns"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "--terminated-runner-pod-grace-period-seconds=30"
+
+  # A negative value hands the grace period back to the pod itself.
+  - it: should render a negative terminated runner pod grace period
+    set:
+      controller:
+        manager:
+          config:
+            terminatedRunnerPodGracePeriodSeconds: -1
+    release:
+      name: "test-arc"
+      namespace: "test-ns"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "--terminated-runner-pod-grace-period-seconds=-1"
